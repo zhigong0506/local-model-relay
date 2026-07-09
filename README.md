@@ -1,5 +1,7 @@
 # Local Model Relay
 
+[中文说明](README.zh-CN.md)
+
 Local Model Relay is a zero-build local control panel and OpenAI-compatible proxy for personal model-provider failover.
 
 It lets you keep multiple upstream providers behind one local `/v1` endpoint, manage provider priority from a browser UI, define per-model routes, and automatically fail over when an upstream returns retryable errors such as `401`, `403`, `429`, `500`, `502`, `503`, or `504`.
