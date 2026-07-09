@@ -1,0 +1,15 @@
+{
+  "name": "local-model-relay",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.mjs",
+    "check": "node --check src/server.mjs && node --check src/config-store.mjs && node --check src/state-store.mjs && node --check src/proxy.mjs && node --check src/provider-test.mjs && node --check src/wire-api.mjs && node --check src/usage.mjs && node --check public/js/main.mjs && node --check scripts/failover-e2e.mjs && node --check scripts/usage-estimate-e2e.mjs",
+    "test:failover": "node scripts/failover-e2e.mjs",
+    "test:usage-estimate": "node scripts/usage-estimate-e2e.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

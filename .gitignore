@@ -1,0 +1,6 @@
+data/config.json
+data/state.json
+logs/
+work/
+*.log
+*.tmp

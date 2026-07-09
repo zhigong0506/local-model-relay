@@ -1,0 +1,270 @@
+import { backupCorruptFile, readJsonFile, writeJsonFile } from './json-file.mjs'
+import { statePath } from './paths.mjs'
+import { addUsage, addWindowUsage, createUsageState, emptyUsageBucket, hourKeyFor, pruneDailyUsage, pruneHourly } from './usage.mjs'
+
+const EMPTY_STATE = {
+  version: 1,
+  providerState: {},
+  requestLog: [],
+  usage: createUsageState(),
+  upstreamUsage: {},
+  startedAt: null,
+}
+
+const DEFAULT_REQUEST_LOG_LIMIT = 1500
+
+export class StateStore {
+  constructor(filePath = statePath) {
+    this.filePath = filePath
+    this.state = this.load()
+    this.state.startedAt = new Date().toISOString()
+    this.persist()
+  }
+
+  getPublic() {
+    return structuredClone(this.state)
+  }
+
+  getProviderState(providerId) {
+    return this.ensureProvider(providerId)
+  }
+
+  isCooling(providerId, now = Date.now()) {
+    return this.ensureProvider(providerId).cooldownUntil > now
+  }
+
+  markAttempt(providerId, now = Date.now()) {
+    const entry = this.ensureProvider(providerId)
+    entry.lastAttemptAt = now
+    entry.updatedAt = now
+    this.persist()
+  }
+
+  markSuccess(providerId, detail = {}, now = Date.now()) {
+    const entry = this.ensureProvider(providerId)
+    const latencyMs = detail.latencyMs ?? null
+    entry.successCount += 1
+    entry.consecutiveFailures = 0
+    entry.cooldownUntil = 0
+    entry.lastStatus = detail.status || 200
+    entry.lastError = null
+    entry.lastLatencyMs = latencyMs
+    if (latencyMs !== null) {
+      entry.averageLatencyMs = entry.averageLatencyMs === null
+        ? latencyMs
+        : Math.round(entry.averageLatencyMs * 0.8 + latencyMs * 0.2)
+    }
+    entry.lastSuccessAt = now
+    entry.updatedAt = now
+    this.persist()
+  }
+
+  markFailure(providerId, detail = {}, now = Date.now()) {
+    const entry = this.ensureProvider(providerId)
+    entry.failureCount += 1
+    entry.consecutiveFailures += 1
+    entry.lastStatus = detail.status || null
+    entry.lastError = detail.message || 'Upstream request failed.'
+    entry.lastLatencyMs = detail.latencyMs ?? null
+    entry.lastFailureAt = now
+
+    const cooldownSeconds = Number(detail.cooldownSeconds) || 0
+    if (cooldownSeconds > 0) {
+      entry.cooldownUntil = now + cooldownSeconds * 1000
+    }
+
+    entry.updatedAt = now
+    this.persist()
+  }
+
+  addRequestLog(entry, limit = DEFAULT_REQUEST_LOG_LIMIT) {
+    const normalizedLimit = normalizeRequestLogLimit(limit)
+    this.state.requestLog.unshift({
+      id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      time: new Date().toISOString(),
+      ...entry,
+    })
+    this.state.requestLog = this.state.requestLog.slice(0, normalizedLimit)
+    this.persist()
+  }
+
+  recordUsage(providerId, model, usage, detail = {}, now = Date.now()) {
+    if (!usage) return null
+
+    const dateKey = new Date(now).toISOString().slice(0, 10)
+    const latencyMs = Number(detail.latencyMs)
+    this.state.usage.totals = addUsage(this.state.usage.totals, usage)
+    this.state.usage.byProvider[providerId] = addUsage(this.state.usage.byProvider[providerId], usage)
+    if (detail.credentialId) {
+      this.state.usage.byCredential[detail.credentialId] = addUsage(this.state.usage.byCredential[detail.credentialId], usage)
+    }
+    this.state.usage.byModel[model || '(unknown)'] = addUsage(this.state.usage.byModel[model || '(unknown)'], usage)
+    this.state.usage.daily[dateKey] = addUsage(this.state.usage.daily[dateKey], usage)
+    this.state.usage.daily = pruneDailyUsage(this.state.usage.daily, 90)
+
+    const hourKey = hourKeyFor(now)
+    const hourly = this.state.usage.providerHourly[providerId] || {}
+    hourly[hourKey] = addWindowUsage(hourly[hourKey], usage, latencyMs)
+    this.state.usage.providerHourly[providerId] = pruneHourly(hourly)
+
+    this.persist()
+    return usage
+  }
+
+  recordUpstreamUsage(providerId, credentialId, snapshot, now = Date.now()) {
+    if (!providerId || !credentialId || !snapshot) return null
+    const entry = {
+      providerId,
+      credentialId,
+      group: toText(snapshot.group),
+      username: toText(snapshot.username ?? snapshot.name ?? snapshot.display_name),
+      quota: toNumber(snapshot.quota ?? snapshot.remain_quota ?? snapshot.remaining_quota),
+      usedQuota: toNumber(snapshot.used_quota ?? snapshot.usedQuota),
+      requestCount: toNumber(snapshot.request_count ?? snapshot.requestCount),
+      status: toText(snapshot.status),
+      updatedAt: now,
+    }
+    this.state.upstreamUsage[credentialId] = entry
+    this.persist()
+    return entry
+  }
+
+  clearUsage() {
+    this.state.usage = createUsageState()
+    this.persist()
+    return this.getPublic()
+  }
+
+  clearRequestLog() {
+    this.state.requestLog = []
+    this.persist()
+    return this.getPublic()
+  }
+
+  pruneProviders(providerIds) {
+    const keep = new Set(providerIds)
+    let changed = false
+
+    for (const providerId of Object.keys(this.state.providerState)) {
+      if (!keep.has(providerId)) {
+        delete this.state.providerState[providerId]
+        changed = true
+      }
+    }
+
+    if (changed) this.persist()
+    return this.getPublic()
+  }
+
+  resetProvider(providerId) {
+    this.state.providerState[providerId] = createProviderState(providerId)
+    this.persist()
+    return this.state.providerState[providerId]
+  }
+
+  load() {
+    try {
+      return normalizeState(readJsonFile(this.filePath, EMPTY_STATE))
+    } catch (error) {
+      backupCorruptFile(this.filePath, error instanceof Error ? error.message : String(error))
+      return normalizeState(EMPTY_STATE)
+    }
+  }
+
+  ensureProvider(providerId) {
+    if (!this.state.providerState[providerId]) {
+      this.state.providerState[providerId] = createProviderState(providerId)
+    }
+    return this.state.providerState[providerId]
+  }
+
+  persist() {
+    writeJsonFile(this.filePath, this.state)
+  }
+}
+
+function normalizeState(value) {
+  const state = {
+    version: 1,
+    providerState: {},
+    requestLog: Array.isArray(value?.requestLog) ? value.requestLog.slice(0, DEFAULT_REQUEST_LOG_LIMIT) : [],
+    usage: createUsageState(value?.usage || { totals: emptyUsageBucket() }),
+    upstreamUsage: normalizeUpstreamUsage(value?.upstreamUsage),
+    startedAt: typeof value?.startedAt === 'string' ? value.startedAt : null,
+  }
+
+  if (value && typeof value.providerState === 'object' && !Array.isArray(value.providerState)) {
+    for (const [providerId, entry] of Object.entries(value.providerState)) {
+      state.providerState[providerId] = {
+        ...createProviderState(providerId),
+        ...(entry && typeof entry === 'object' && !Array.isArray(entry) ? entry : {}),
+        providerId,
+      }
+    }
+  }
+
+  return state
+}
+
+function normalizeRequestLogLimit(value) {
+  const number = Number(value)
+  if (!Number.isFinite(number)) return DEFAULT_REQUEST_LOG_LIMIT
+  return Math.min(3000, Math.max(200, Math.round(number)))
+}
+
+function normalizeUpstreamUsage(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+  const out = {}
+  for (const [credentialId, entry] of Object.entries(value)) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue
+    const normalized = {
+      providerId: toText(entry.providerId),
+      credentialId: toText(entry.credentialId) || credentialId,
+      group: toText(entry.group),
+      username: toText(entry.username),
+      quota: toNumber(entry.quota),
+      usedQuota: toNumber(entry.usedQuota ?? entry.used_quota),
+      requestCount: toNumber(entry.requestCount ?? entry.request_count),
+      status: toText(entry.status),
+      updatedAt: toNumber(entry.updatedAt),
+    }
+    if (
+      normalized.group ||
+      normalized.username ||
+      normalized.quota ||
+      normalized.usedQuota ||
+      normalized.requestCount ||
+      normalized.status
+    ) {
+      out[credentialId] = normalized
+    }
+  }
+  return out
+}
+
+function toText(value) {
+  return typeof value === 'string' ? value : value == null ? '' : String(value)
+}
+
+function toNumber(value) {
+  const number = Number(value)
+  return Number.isFinite(number) ? number : 0
+}
+
+function createProviderState(providerId) {
+  return {
+    providerId,
+    successCount: 0,
+    failureCount: 0,
+    consecutiveFailures: 0,
+    cooldownUntil: 0,
+    lastStatus: null,
+    lastError: null,
+    lastLatencyMs: null,
+    averageLatencyMs: null,
+    lastAttemptAt: null,
+    lastSuccessAt: null,
+    lastFailureAt: null,
+    updatedAt: Date.now(),
+  }
+}

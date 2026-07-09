@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "service": {
+    "enabled": true,
+    "listenHost": "127.0.0.1",
+    "listenPort": 25818,
+    "localApiKey": "local-relay",
+    "requestTimeoutMs": 90000,
+    "retryStatusCodes": [401, 403, 408, 409, 425, 429, 500, 502, 503, 504],
+    "maxAttempts": 8,
+    "defaultCooldownSeconds": 60,
+    "logRequests": true,
+    "collectUsage": true,
+    "collectStreamUsage": true,
+    "quotaPerCny": 500000,
+    "requestLogLimit": 1500
+  },
+  "providers": [],
+  "routes": [],
+  "updatedAt": null
+}
