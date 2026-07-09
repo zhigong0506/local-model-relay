@@ -19,6 +19,37 @@ It lets you keep multiple upstream providers behind one local `/v1` endpoint, ma
 - Deterministic failover, sticky-routing, outbound-proxy, and usage-estimate regression tests
 - No build step, no npm dependencies, no external database
 
+## Requirements
+
+- Node.js 20 or newer
+- Git, if you want to install by cloning the repository
+
+No `npm install` step is required because the project has no runtime npm dependencies.
+
+## Installation
+
+Install from GitHub:
+
+```powershell
+git clone https://github.com/zhigong0506/local-model-relay.git
+cd local-model-relay
+npm start
+```
+
+Then open:
+
+```text
+http://127.0.0.1:25818/admin
+```
+
+On Windows, you can create desktop shortcuts after cloning:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\create-shortcut.ps1
+```
+
+This creates shortcuts for opening and stopping Local Model Relay.
+
 ## Quick Start
 
 ```powershell
