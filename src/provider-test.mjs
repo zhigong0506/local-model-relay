@@ -1,5 +1,6 @@
 import { buildCandidates } from './proxy.mjs'
 import { resolveActiveKey } from './config-store.mjs'
+import { getCachedSystemProxy, resolveProviderOutboundProxy } from './outbound-proxy.mjs'
 import {
   buildWireBody,
   buildWirePlan,
@@ -7,18 +8,20 @@ import {
   normalizeUsagePayload,
   transformResponsePayload,
 } from './wire-api.mjs'
+import { upstreamFetch } from './upstream-fetch.mjs'
 
-export async function testProvider(provider, model = null) {
+export async function testProvider(provider, model = null, serviceConfig = {}) {
   const selectedModel = model || provider.models[0] || 'gpt-4o-mini'
   const startedAt = Date.now()
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), provider.timeoutMs || 30000)
 
   try {
-    const response = await fetch(buildModelsUrl(provider.baseUrl), {
+    const response = await upstreamFetch(buildModelsUrl(provider.baseUrl), {
       method: 'GET',
       headers: buildAuthHeaders(provider),
       signal: controller.signal,
+      proxyUrl: resolveProviderProxy(provider, serviceConfig).proxyUrl,
     })
     const models = response.ok ? await readModels(response) : []
 
@@ -46,7 +49,7 @@ export async function testProvider(provider, model = null) {
   }
 }
 
-export async function realTestProvider(provider, input = {}) {
+export async function realTestProvider(provider, input = {}, serviceConfig = {}) {
   const selectedCredential = selectCredential(provider, String(input.credentialId || ''))
   const testProvider = selectedCredential
     ? { ...provider, activeCredentialId: selectedCredential.id }
@@ -57,9 +60,9 @@ export async function realTestProvider(provider, input = {}) {
   const startedAt = Date.now()
   const wireApi = normalizeWireApi(input.wireApi) || provider.wireApi || 'chat'
 
-  const first = await sendChatCompletion(testProvider, selectedModel, prompt, maxTokens, 'max_tokens', wireApi)
+  const first = await sendChatCompletion(testProvider, selectedModel, prompt, maxTokens, 'max_tokens', wireApi, serviceConfig)
   if (!first.ok && /max_tokens|max_completion_tokens/i.test(first.message || '')) {
-    const retry = await sendChatCompletion(testProvider, selectedModel, prompt, maxTokens, 'max_completion_tokens', wireApi)
+    const retry = await sendChatCompletion(testProvider, selectedModel, prompt, maxTokens, 'max_completion_tokens', wireApi, serviceConfig)
     return {
       ...retry,
       credentialId: selectedCredential?.id || provider.activeCredentialId || '',
@@ -81,7 +84,7 @@ export async function realTestProvider(provider, input = {}) {
   }
 }
 
-export async function syncProviderCredentialUsage(provider, input = {}) {
+export async function syncProviderCredentialUsage(provider, input = {}, serviceConfig = {}) {
   const selectedCredential = selectCredential(provider, String(input.credentialId || ''))
   if (!selectedCredential) {
     return {
@@ -99,10 +102,11 @@ export async function syncProviderCredentialUsage(provider, input = {}) {
   const timeout = setTimeout(() => controller.abort(), provider.timeoutMs || 30000)
 
   try {
-    const response = await fetch(buildUserSelfUrl(provider.baseUrl), {
+    const response = await upstreamFetch(buildUserSelfUrl(provider.baseUrl), {
       method: 'GET',
       headers: buildAuthHeaders(testProvider),
       signal: controller.signal,
+      proxyUrl: resolveProviderProxy(testProvider, serviceConfig).proxyUrl,
     })
     const text = await response.text()
     const payload = parseJson(text)
@@ -141,7 +145,7 @@ export async function syncProviderCredentialUsage(provider, input = {}) {
   }
 }
 
-async function sendChatCompletion(provider, model, prompt, maxTokens, tokenField, wireApi) {
+async function sendChatCompletion(provider, model, prompt, maxTokens, tokenField, wireApi, serviceConfig) {
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), provider.timeoutMs || 30000)
 
@@ -158,11 +162,12 @@ async function sendChatCompletion(provider, model, prompt, maxTokens, tokenField
     const headers = buildAuthHeaders(provider)
     headers.set('content-type', 'application/json')
 
-    const response = await fetch(buildWireUrl(provider.baseUrl, requestUrl, plan), {
+    const response = await upstreamFetch(buildWireUrl(provider.baseUrl, requestUrl, plan), {
       method: 'POST',
       headers,
       body: JSON.stringify(body),
       signal: controller.signal,
+      proxyUrl: resolveProviderProxy(provider, serviceConfig).proxyUrl,
     })
     const text = await response.text()
     const payload = parseJson(text)
@@ -196,6 +201,12 @@ function buildModelsUrl(baseUrl) {
   const trimmedPath = parsedBase.pathname.replace(/\/+$/, '')
   const normalized = trimmedPath === '' ? `${parsedBase.origin}/v1` : baseUrl.replace(/\/+$/, '')
   return `${normalized}/models`
+}
+
+function resolveProviderProxy(provider, serviceConfig = {}) {
+  return resolveProviderOutboundProxy(provider, serviceConfig, {
+    systemProxy: getCachedSystemProxy(),
+  })
 }
 
 function buildUserSelfUrl(baseUrl) {

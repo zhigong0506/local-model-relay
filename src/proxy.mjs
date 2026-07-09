@@ -1,4 +1,5 @@
 import { resolveActiveCredential, resolveActiveKey } from './config-store.mjs'
+import { getCachedSystemProxy, resolveProviderOutboundProxy } from './outbound-proxy.mjs'
 import {
   buildWireBody,
   buildWirePlan,
@@ -6,6 +7,7 @@ import {
   normalizeUsagePayload,
   transformWireResponse,
 } from './wire-api.mjs'
+import { upstreamFetch } from './upstream-fetch.mjs'
 
 const HOP_BY_HOP_HEADERS = new Set([
   'connection',
@@ -213,6 +215,7 @@ export async function handleProxyRequest(req, res, context) {
           status: upstreamResponse.status,
           latencyMs,
         })
+        stateStore.advanceStartProvider?.(candidate.provider.id)
         if (capturedUsage) {
           stateStore.recordUsage(candidate.provider.id, candidate.model, capturedUsage, {
             credentialId: attempt.credentialId,
@@ -302,7 +305,7 @@ export function buildCandidates(config, route, virtualModel, stateStore) {
       if (!provider || stateStore.isCooling(provider.id, now)) continue
       candidates.push({ provider, model: target.model })
     }
-    return candidates
+    return rotateToStart(candidates, stateStore.getStartProviderId?.())
   }
 
   for (const provider of enabledProviders.values()) {
@@ -311,7 +314,14 @@ export function buildCandidates(config, route, virtualModel, stateStore) {
     candidates.push({ provider, model: virtualModel })
   }
 
-  return candidates
+  return rotateToStart(candidates, stateStore.getStartProviderId?.())
+}
+
+function rotateToStart(candidates, startProviderId = '') {
+  if (!startProviderId || candidates.length < 2) return candidates
+  const index = candidates.findIndex((candidate) => candidate.provider.id === startProviderId)
+  if (index <= 0) return candidates
+  return [...candidates.slice(index), ...candidates.slice(0, index)]
 }
 
 async function callUpstream(req, body, candidate, serviceConfig) {
@@ -322,11 +332,14 @@ async function callUpstream(req, body, candidate, serviceConfig) {
   const upstreamBody = buildWireBody(body, candidate, serviceConfig, wirePlan)
 
   try {
-    const response = await fetch(upstreamUrl, {
+    const response = await upstreamFetch(upstreamUrl, {
       method: req.method,
       headers: buildHeaders(req.headers, candidate.provider),
       body: JSON.stringify(upstreamBody),
       signal: controller.signal,
+      proxyUrl: resolveProviderOutboundProxy(candidate.provider, serviceConfig, {
+        systemProxy: getCachedSystemProxy(),
+      }).proxyUrl,
     })
     clearTimeout(timeout)
     return {

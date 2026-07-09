@@ -56,12 +56,18 @@ function bindActions() {
   $('#serviceToggle').addEventListener('change', toggleService)
   $('#newProviderBtn').addEventListener('click', () => openProviderDialog())
   $('#quickProviderBtn').addEventListener('click', () => openProviderDialog())
+  $('#routingStartMode').addEventListener('change', saveRoutingMode)
+  $('#clearStartProviderBtn').addEventListener('click', clearStartProvider)
+  formField($('#providerForm'), 'providerOutboundProxyMode').addEventListener('change', renderProviderProxyFields)
   $('#newRouteBtn').addEventListener('click', () => openRouteDialog())
   $('#providerForm').addEventListener('submit', saveProvider)
   $('#realTestForm').addEventListener('submit', runRealTest)
   $('#routeForm').addEventListener('submit', saveRoute)
   bindTargetDragSort()
   $('#settingsForm').addEventListener('submit', saveSettings)
+  $$('[name="outboundProxyMode"]', $('#settingsForm')).forEach((input) => {
+    input.addEventListener('change', renderOutboundProxyFields)
+  })
   $('#addTargetBtn').addEventListener('click', () => addTargetRow())
   $('#addCredentialBtn').addEventListener('click', () => addCredentialRow())
   $('#exitBtn').addEventListener('click', exitProcess)
@@ -96,6 +102,8 @@ async function refreshState() {
   try {
     state.runtime = await api('/api/state')
     renderStatus()
+    renderOutboundStatus()
+    renderRoutingBar()
     renderProviders()
     renderUsage()
     renderDashboard()
@@ -109,6 +117,7 @@ async function refreshState() {
 function render() {
   renderStatus()
   renderSettings()
+  renderRoutingBar()
   renderProviders()
   renderRoutes()
   renderUsage()
@@ -128,6 +137,7 @@ function renderStatus() {
   $('#serviceToggle').checked = service.enabled
   $('#successRate').textContent = calculateSuccessRate()
   $('#todayTokens').textContent = formatTokenCompact(todayUsage().totalTokens)
+  $('#outboundState').textContent = outboundStatusLabel(state.runtime?.outbound)
 }
 
 function renderSettings() {
@@ -145,32 +155,75 @@ function renderSettings() {
   formField(form, 'collectStreamUsage').checked = service.collectStreamUsage
   formField(form, 'quotaPerCny').value = service.quotaPerCny || 500000
   formField(form, 'requestLogLimit').value = service.requestLogLimit || 1500
+  $$('[name="outboundProxyMode"]', form).forEach((input) => {
+    input.checked = input.value === (service.outboundProxyMode || 'direct')
+  })
+  formField(form, 'outboundProxyUrl').value = service.outboundProxyUrl || ''
+  renderOutboundProxyFields()
+  renderOutboundStatus()
+}
+
+function renderOutboundProxyFields() {
+  const form = $('#settingsForm')
+  const mode = formField(form, 'outboundProxyMode').value || 'direct'
+  $('#customProxyField').hidden = mode !== 'custom'
+}
+
+function renderOutboundStatus() {
+  const outbound = state.runtime?.outbound
+  $('#outboundEffective').textContent = `当前：${outboundStatusLabel(outbound)}`
+  const notice = $('#outboundNotice')
+  notice.textContent = outboundNoticeText(outbound)
+  notice.classList.toggle('warn', Boolean(outbound?.needsRestart))
+}
+
+function renderRoutingBar() {
+  const routing = state.runtime?.routing || {}
+  const mode = routing.startMode === 'locked' ? 'locked' : 'auto'
+  const provider = (state.config?.providers || []).find((item) => item.id === routing.startProviderId)
+  const modeLabel = routingModeLabel(mode)
+
+  $('#routingStartMode').value = mode
+  $('#routingStartName').textContent = provider
+    ? provider.name
+    : routing.startProviderId
+      ? '起点线路已失效'
+      : '默认优先级'
+  $('#routingStartHint').textContent = provider
+    ? `${modeLabel} · 请求会从这条线路开始`
+    : routing.startProviderId
+      ? `${modeLabel} · 当前候选中找不到这条线路`
+      : `${modeLabel} · 未指定起点时按优先级从头开始`
+  $('#clearStartProviderBtn').disabled = !routing.startProviderId
 }
 
 function renderProviders() {
   if (state.draggingProviderId) return
   const rows = $('#providerRows')
   const providers = [...state.config.providers].sort((a, b) => a.priority - b.priority)
+  const startProviderId = state.runtime?.routing?.startProviderId || ''
   $('#providerEmptyGuide').hidden = providers.length > 0
   rows.innerHTML = providers.length ? '' : `<tr><td colspan="9" class="empty">还没有线路，先新增一个中转站。</td></tr>`
 
   for (const provider of providers) {
     const entry = state.runtime.providerState[provider.id] || {}
+    const isStartProvider = provider.id === startProviderId
     const tr = document.createElement('tr')
     tr.dataset.providerId = provider.id
     tr.draggable = true
     tr.className = 'draggable-row'
     tr.innerHTML = `
-      <td><div class="status-cell"><span class="drag-handle" title="拖拽调整优先级" aria-label="拖拽调整优先级">↕</span>${providerBadge(provider, entry)}</div></td>
+      <td><div class="status-cell"><span class="drag-handle" title="拖拽调整优先级" aria-label="拖拽调整优先级">↕</span>${providerBadge(provider, entry)}${isStartProvider ? '<span class="pill info">起点</span>' : ''}</div></td>
       <td><strong>${escapeHtml(provider.name)}</strong><br><small>${escapeHtml(provider.tags.join(', ') || provider.activeCredentialLabel || '未设置分组')}</small></td>
       <td>${escapeHtml(provider.baseUrl)}</td>
       <td>${credentialSelect(provider)}</td>
-      <td>${escapeHtml(provider.models.slice(0, 4).join(', ') || '通配')}<br><small>${wireApiLabel(provider.wireApi)}</small></td>
+      <td>${escapeHtml(provider.models.slice(0, 4).join(', ') || '通配')}<br><small>${wireApiLabel(provider.wireApi)} · ${providerProxyLabel(provider)}</small></td>
       <td>${provider.priority}</td>
       <td>${providerStats(entry)}</td>
       <td>${lastProviderState(entry)}</td>
       <td>
         <div class="row-actions">
+          <button data-action="set-start-provider" data-id="${provider.id}" ${isStartProvider ? 'disabled' : ''}>${isStartProvider ? '当前起点' : '设为起点'}</button>
           <button data-action="test" data-id="${provider.id}">测试</button>
           <button data-action="real-test" data-id="${provider.id}">真实测试</button>
           <button data-action="sync-usage" data-id="${provider.id}">同步扣账</button>
@@ -844,6 +897,19 @@ async function handleProviderAction(event) {
 
   if (button.dataset.action === 'edit-provider') openProviderDialog(provider)
   if (button.dataset.action === 'real-test') openRealTestDialog(provider, { autoRun: true })
+  if (button.dataset.action === 'set-start-provider') {
+    state.runtime = await api('/api/routing/start', {
+      method: 'POST',
+      body: {
+        providerId: provider.id,
+        mode: state.runtime?.routing?.startMode || 'auto',
+      },
+    })
+    toast(`已设为路由起点：${provider.name}`)
+    renderStatus()
+    renderRoutingBar()
+    renderProviders()
+  }
   if (button.dataset.action === 'toggle-provider') {
     await api(`/api/providers/${provider.id}`, { method: 'PATCH', body: { enabled: !provider.enabled } })
     toast(provider.enabled ? '线路已停用' : '线路已启用')
@@ -891,6 +957,25 @@ async function handleProviderAction(event) {
       button.textContent = '同步扣账'
     }
   }
+}
+
+async function saveRoutingMode(event) {
+  const mode = event.currentTarget.value === 'locked' ? 'locked' : 'auto'
+  const providerId = state.runtime?.routing?.startProviderId || ''
+  state.runtime = await api('/api/routing/start', {
+    method: 'POST',
+    body: { providerId, mode },
+  })
+  renderRoutingBar()
+  renderProviders()
+  toast(mode === 'locked' ? '路由起点已锁定' : '路由起点将随成功线路自动推进')
+}
+
+async function clearStartProvider() {
+  state.runtime = await api('/api/routing/start', { method: 'DELETE' })
+  renderRoutingBar()
+  renderProviders()
+  toast('已清除路由起点')
 }
 
 function openRealTestDialog(provider, options = {}) {
@@ -1032,6 +1117,8 @@ function openProviderDialog(provider = null) {
   formField(form, 'baseUrl').value = provider?.baseUrl || ''
   formField(form, 'authMode').value = provider?.authMode || 'authorization'
   formField(form, 'wireApi').value = provider?.wireApi || 'chat'
+  formField(form, 'providerOutboundProxyMode').value = provider?.outboundProxyMode || 'inherit'
+  formField(form, 'providerOutboundProxyUrl').value = provider?.outboundProxyUrl || ''
   formField(form, 'priority').value = provider?.priority ?? nextProviderPriority()
   formField(form, 'timeoutMs').value = provider?.timeoutMs || state.config.service.requestTimeoutMs
   formField(form, 'cooldownSeconds').value = provider?.cooldownSeconds ?? state.config.service.defaultCooldownSeconds
@@ -1044,7 +1131,14 @@ function openProviderDialog(provider = null) {
     ? provider.credentials
     : [{ id: '', label: '默认', apiKeySet: false, apiKeyMasked: '', enabled: true, note: '' }]
   credentials.forEach((credential) => addCredentialRow(credential, provider?.activeCredentialId))
+  renderProviderProxyFields()
   $('#providerDialog').showModal()
+}
+
+function renderProviderProxyFields() {
+  const form = $('#providerForm')
+  const mode = formField(form, 'providerOutboundProxyMode').value || 'inherit'
+  $('#providerCustomProxyField').hidden = mode !== 'custom'
 }
 
 async function saveProvider(event) {
@@ -1057,6 +1151,8 @@ async function saveProvider(event) {
     activeCredentialId: $('.credential-row input[name="activeCredential"]:checked')?.value || '',
     authMode: formField(form, 'authMode').value,
     wireApi: formField(form, 'wireApi').value,
+    outboundProxyMode: formField(form, 'providerOutboundProxyMode').value || 'inherit',
+    outboundProxyUrl: formField(form, 'providerOutboundProxyUrl').value,
     priority: Number(formField(form, 'priority').value),
     timeoutMs: Number(formField(form, 'timeoutMs').value),
     cooldownSeconds: Number(formField(form, 'cooldownSeconds').value),
@@ -1281,7 +1377,8 @@ async function saveRoute(event) {
 async function saveSettings(event) {
   event.preventDefault()
   const form = event.currentTarget
-  await api('/api/service', {
+  const previousService = state.config.service
+  state.config = await api('/api/service', {
     method: 'PATCH',
     body: {
       listenHost: formField(form, 'listenHost').value,
@@ -1296,10 +1393,16 @@ async function saveSettings(event) {
       collectStreamUsage: formField(form, 'collectStreamUsage').checked,
       quotaPerCny: Number(formField(form, 'quotaPerCny').value),
       requestLogLimit: Number(formField(form, 'requestLogLimit').value),
+      outboundProxyMode: formField(form, 'outboundProxyMode').value || 'direct',
+      outboundProxyUrl: formField(form, 'outboundProxyUrl').value,
     },
   })
-  toast('设置已保存；端口变更需重启程序')
-  await refreshAll()
+  state.runtime = await api('/api/state')
+  render()
+  const portChanged =
+    previousService.listenHost !== state.config.service.listenHost ||
+    Number(previousService.listenPort) !== Number(state.config.service.listenPort)
+  toast(portChanged ? '设置已保存；监听地址或端口变更需重启程序' : '设置已保存')
 }
 
 async function clearUsage() {
@@ -1507,6 +1610,27 @@ function todayUsage() {
   return aggregateLocalToday()
 }
 
+function outboundStatusLabel(outbound) {
+  if (!outbound) return '-'
+  const labels = {
+    direct: '直连',
+    system: '系统代理',
+    custom: '自定义代理',
+  }
+  const label = labels[outbound.effectiveMode] || outbound.effectiveMode || '未知'
+  const proxy = outbound.effectiveProxyUrl ? `（${outbound.effectiveProxyUrl}）` : ''
+  return `${label}${proxy}${outbound.needsRestart ? ' / 待重启' : ''}`
+}
+
+function outboundNoticeText(outbound) {
+  if (!outbound) return ''
+  const parts = [outbound.message].filter(Boolean)
+  if (outbound.systemProxyUrl) {
+    parts.push(`检测到系统代理：${outbound.systemProxyUrl}`)
+  }
+  return parts.join(' ')
+}
+
 function usageMini(usage) {
   if (!usage) return '<small>-</small>'
   return `<strong>${formatTokenCompact(usage.totalTokens)}</strong><br><small>入 ${formatTokenCompact(usage.inputTokens)} / 出 ${formatTokenCompact(usage.outputTokens)}${usage.estimated ? ' · 估算' : ''}</small>`
@@ -1572,6 +1696,8 @@ function providerPatch(provider, priority = provider.priority) {
     activeCredentialId: provider.activeCredentialId,
     authMode: provider.authMode,
     wireApi: provider.wireApi || 'chat',
+    outboundProxyMode: provider.outboundProxyMode || 'inherit',
+    outboundProxyUrl: provider.outboundProxyUrl || '',
     priority,
     timeoutMs: provider.timeoutMs,
     cooldownSeconds: provider.cooldownSeconds,
@@ -1591,6 +1717,18 @@ function wireApiLabel(value) {
   if (value === 'responses') return 'Responses'
   if (value === 'auto') return '自动跟随请求'
   return 'Chat Completions'
+}
+
+function providerProxyLabel(provider) {
+  const mode = provider.outboundProxyMode || 'inherit'
+  if (mode === 'direct') return '直连'
+  if (mode === 'system') return '系统代理'
+  if (mode === 'custom') return `自定义代理${provider.outboundProxyUrl ? ` ${provider.outboundProxyUrl}` : ''}`
+  return '跟随全局'
+}
+
+function routingModeLabel(mode) {
+  return mode === 'locked' ? '锁定起点' : '自动推进'
 }
 
 function cssEscape(value) {

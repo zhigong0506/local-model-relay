@@ -13,7 +13,9 @@
     "collectUsage": true,
     "collectStreamUsage": true,
     "quotaPerCny": 500000,
-    "requestLogLimit": 1500
+    "requestLogLimit": 1500,
+    "outboundProxyMode": "direct",
+    "outboundProxyUrl": ""
   },
   "providers": [],
   "routes": [],

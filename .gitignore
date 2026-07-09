@@ -4,3 +4,4 @@ logs/
 work/
 *.log
 *.tmp
+.env

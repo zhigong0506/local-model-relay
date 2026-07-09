@@ -7,5 +7,5 @@ echo   Admin: http://127.0.0.1:25818/admin
 echo   API:   http://127.0.0.1:25818/v1
 echo ============================================
 echo.
-node src\server.mjs
+node scripts\launch-server.mjs
 pause

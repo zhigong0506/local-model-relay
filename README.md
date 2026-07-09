@@ -12,15 +12,17 @@ It lets you keep multiple upstream providers behind one local `/v1` endpoint, ma
 - OpenAI-compatible local API at `http://127.0.0.1:25818/v1`
 - Provider management with priorities, cooldowns, timeouts, credentials, and model lists
 - Model routes that follow provider priority and auto-add matching providers
+- Sticky routing start point with auto-advance or locked mode
+- Global and per-provider outbound proxy modes: direct, system proxy, or custom proxy
 - Chat Completions and Responses protocol bridging
 - Request logs, usage stats, dashboard charts, CSV export, and local usage estimates
-- Deterministic failover and usage-estimate regression tests
+- Deterministic failover, sticky-routing, outbound-proxy, and usage-estimate regression tests
 - No build step, no npm dependencies, no external database
 
 ## Quick Start
 
 ```powershell
-node src\server.mjs
+npm start
 ```
 
 Then open:
@@ -50,6 +52,8 @@ Use `data/config.example.json` as a safe empty template.
 npm run check
 npm run test:failover
 npm run test:usage-estimate
+npm run test:outbound-proxy
+npm run test:sticky-routing
 ```
 
 The e2e tests create temporary local mock providers and routes, call the real local relay endpoint, and clean up after themselves.

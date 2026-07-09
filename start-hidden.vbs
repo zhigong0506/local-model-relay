@@ -6,4 +6,4 @@ Shell.CurrentDirectory = ProjectDir
 If Not Fso.FolderExists(ProjectDir & "\logs") Then
   Fso.CreateFolder(ProjectDir & "\logs")
 End If
-Shell.Run "cmd /c node src\server.mjs >> logs\relay.log 2>&1", 0, False
+Shell.Run "cmd /c node scripts\launch-server.mjs >> logs\relay.log 2>&1", 0, False

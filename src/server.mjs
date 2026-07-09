@@ -2,6 +2,7 @@ import { createServer } from 'node:http'
 import { createReadStream, existsSync } from 'node:fs'
 import { extname, isAbsolute, join, relative, resolve } from 'node:path'
 import { ConfigStore, HttpError } from './config-store.mjs'
+import { getCachedSystemProxy, getOutboundRuntime } from './outbound-proxy.mjs'
 import { StateStore } from './state-store.mjs'
 import { handleProxyRequest } from './proxy.mjs'
 import { publicDir, rootDir } from './paths.mjs'
@@ -43,6 +44,7 @@ server.listen(runtimeConfig.service.listenPort, runtimeConfig.service.listenHost
   const address = `http://${runtimeConfig.service.listenHost}:${runtimeConfig.service.listenPort}`
   console.log(`[relay] admin: ${address}/admin`)
   console.log(`[relay] local api: ${address}/v1`)
+  console.log(`[relay] outbound: ${formatOutboundLog(currentOutboundRuntime(runtimeConfig.service))}`)
   console.log(`[relay] project: ${rootDir}`)
 })
 
@@ -84,15 +86,33 @@ async function routeRequest(req, res) {
   }
 
   if (url.pathname === '/api/state' && req.method === 'GET') {
-    return sendJson(res, 200, stateStore.getPublic())
+    return sendJson(res, 200, runtimeState())
   }
 
   if (url.pathname === '/api/state/logs' && req.method === 'DELETE') {
-    return sendJson(res, 200, stateStore.clearRequestLog())
+    stateStore.clearRequestLog()
+    return sendJson(res, 200, runtimeState())
   }
 
   if (url.pathname === '/api/state/usage' && req.method === 'DELETE') {
-    return sendJson(res, 200, stateStore.clearUsage())
+    stateStore.clearUsage()
+    return sendJson(res, 200, runtimeState())
+  }
+
+  if (url.pathname === '/api/routing/start' && req.method === 'POST') {
+    const body = await readJson(req)
+    const providerId = String(body.providerId || '').trim()
+    const config = configStore.get()
+    if (providerId && !config.providers.some((provider) => provider.id === providerId)) {
+      throw new HttpError(404, 'provider_not_found', 'Provider not found.')
+    }
+    stateStore.setStartProvider(providerId, body.mode)
+    return sendJson(res, 200, runtimeState())
+  }
+
+  if (url.pathname === '/api/routing/start' && req.method === 'DELETE') {
+    stateStore.clearStartProvider()
+    return sendJson(res, 200, runtimeState())
   }
 
   if (url.pathname === '/api/service' && req.method === 'PATCH') {
@@ -129,7 +149,7 @@ async function routeRequest(req, res) {
     const config = configStore.get()
     const provider = config.providers.find((item) => item.id === providerTestMatch[1])
     if (!provider) throw new HttpError(404, 'provider_not_found', 'Provider not found.')
-    return sendJson(res, 200, await testProvider(provider))
+    return sendJson(res, 200, await testProvider(provider, null, config.service))
   }
 
   const providerRealTestMatch = url.pathname.match(/^\/api\/providers\/([^/]+)\/real-test$/)
@@ -137,7 +157,7 @@ async function routeRequest(req, res) {
     const config = configStore.get()
     const provider = config.providers.find((item) => item.id === providerRealTestMatch[1])
     if (!provider) throw new HttpError(404, 'provider_not_found', 'Provider not found.')
-    const result = await realTestProvider(provider, await readJson(req))
+    const result = await realTestProvider(provider, await readJson(req), config.service)
     recordRealTestResult(provider, result)
     return sendJson(res, 200, result)
   }
@@ -147,7 +167,7 @@ async function routeRequest(req, res) {
     const config = configStore.get()
     const provider = config.providers.find((item) => item.id === providerUsageSyncMatch[1])
     if (!provider) throw new HttpError(404, 'provider_not_found', 'Provider not found.')
-    const result = await syncProviderCredentialUsage(provider, await readJson(req))
+    const result = await syncProviderCredentialUsage(provider, await readJson(req), config.service)
     if (result.ok && result.snapshot) {
       result.upstreamUsage = stateStore.recordUpstreamUsage(provider.id, result.credentialId, result.snapshot)
       result.provider = configStore.updateCredentialMetadata(provider.id, result.credentialId, {
@@ -196,6 +216,7 @@ async function routeRequest(req, res) {
       providers: config.providers.length,
       routes: config.routes.length,
       admin: '/admin',
+      outbound: currentOutboundRuntime(config.service),
     })
   }
 
@@ -293,6 +314,25 @@ function recordRealTestResult(provider, result) {
       cooldownSeconds: 0,
     })
   }
+}
+
+function runtimeState() {
+  const config = configStore.get()
+  return {
+    ...stateStore.getPublic(),
+    outbound: currentOutboundRuntime(config.service),
+  }
+}
+
+function currentOutboundRuntime(service) {
+  return getOutboundRuntime(service, process.env, process.execArgv, {
+    systemProxy: getCachedSystemProxy(process.env),
+  })
+}
+
+function formatOutboundLog(outbound) {
+  if (outbound.effectiveMode === 'direct') return outbound.message || 'direct'
+  return `${outbound.effectiveMode} (${outbound.effectiveProxyUrl || 'proxy'})`
 }
 
 function assertAllowedHost(rawHost = '') {

@@ -1,5 +1,12 @@
 import { randomUUID } from 'node:crypto'
 import { backupCorruptFile, readJsonFile, writeJsonFile } from './json-file.mjs'
+import {
+  isMaskedProxyUrl,
+  maskProxyUrl,
+  normalizeOutboundProxyMode,
+  normalizeProviderOutboundProxyMode,
+  normalizeProxyUrl,
+} from './outbound-proxy.mjs'
 import { configPath } from './paths.mjs'
 
 export const DEFAULT_CONFIG = {
@@ -18,6 +25,8 @@ export const DEFAULT_CONFIG = {
     collectStreamUsage: true,
     quotaPerCny: 500000,
     requestLogLimit: 1500,
+    outboundProxyMode: 'direct',
+    outboundProxyUrl: '',
   },
   providers: [],
   routes: [],
@@ -43,7 +52,12 @@ export class ConfigStore {
   }
 
   updateService(patch) {
-    this.config.service = normalizeService({ ...this.config.service, ...patch })
+    const nextPatch = { ...patch }
+    if (isMaskedProxyUrl(nextPatch.outboundProxyUrl)) {
+      nextPatch.outboundProxyUrl = this.config.service.outboundProxyUrl
+    }
+    assertServicePatch(nextPatch)
+    this.config.service = normalizeService({ ...this.config.service, ...nextPatch })
     this.touch()
     this.persist()
     return this.getPublic()
@@ -60,9 +74,11 @@ export class ConfigStore {
     const config = structuredClone(this.config)
     if (!includeSecrets) {
       config.service.localApiKey = maskSecret(config.service.localApiKey)
+      config.service.outboundProxyUrl = maskProxyUrl(config.service.outboundProxyUrl)
       config.providers = config.providers.map((provider) => ({
         ...provider,
         apiKey: maskSecret(resolveActiveKey(provider)),
+        outboundProxyUrl: maskProxyUrl(provider.outboundProxyUrl),
         credentials: provider.credentials.map((credential) => ({
           ...credential,
           apiKey: maskSecret(credential.apiKey),
@@ -87,6 +103,9 @@ export class ConfigStore {
     payload.service = isRecord(payload.service) ? payload.service : {}
     if (isMaskedOrEmpty(payload.service.localApiKey)) {
       payload.service.localApiKey = this.config.service.localApiKey
+    }
+    if (isMaskedProxyUrl(payload.service.outboundProxyUrl)) {
+      payload.service.outboundProxyUrl = this.config.service.outboundProxyUrl
     }
 
     if (Array.isArray(payload.providers)) {
@@ -135,19 +154,23 @@ export class ConfigStore {
   }
 
   createProvider(input) {
-    const provider = normalizeProvider({
+    const rawProvider = {
       id: randomUUID(),
       enabled: true,
       priority: nextPriority(this.config.providers),
       authMode: 'authorization',
       wireApi: 'chat',
+      outboundProxyMode: 'inherit',
+      outboundProxyUrl: '',
       timeoutMs: this.config.service.requestTimeoutMs,
       cooldownSeconds: this.config.service.defaultCooldownSeconds,
       models: [],
       tags: [],
       notes: '',
       ...input,
-    })
+    }
+    assertProviderPatch(rawProvider)
+    const provider = normalizeProvider(rawProvider)
 
     this.config.providers.push(provider)
     syncRoutesWithProviders(this.config)
@@ -162,6 +185,7 @@ export class ConfigStore {
 
     const existing = this.config.providers[index]
     const preservedInput = preserveProviderSecrets(input, existing)
+    assertProviderPatch(preservedInput)
     const next = normalizeProvider({
       ...existing,
       ...preservedInput,
@@ -267,14 +291,23 @@ export function publicConfig(config) {
   const providers = config.providers.map(publicProvider)
   return {
     ...structuredClone(config),
+    service: publicService(config.service),
     providers,
     routes: config.routes.map((route) => publicRoute(route, config.providers)),
+  }
+}
+
+function publicService(service) {
+  return {
+    ...structuredClone(service),
+    outboundProxyUrl: maskProxyUrl(service.outboundProxyUrl),
   }
 }
 
 export function publicProvider(provider) {
   const clone = { ...provider }
   delete clone.apiKey
+  clone.outboundProxyUrl = maskProxyUrl(provider.outboundProxyUrl)
   clone.credentials = provider.credentials.map((credential) => ({
     id: credential.id,
     label: credential.label,
@@ -320,6 +353,10 @@ function preserveProviderSecrets(input, existing) {
 
   if (isMaskedOrEmpty(next.apiKey)) {
     next.apiKey = resolveActiveKey(existing)
+  }
+
+  if (isMaskedProxyUrl(next.outboundProxyUrl)) {
+    next.outboundProxyUrl = existing.outboundProxyUrl || ''
   }
 
   if (Array.isArray(next.credentials)) {
@@ -379,6 +416,8 @@ function normalizeService(input) {
     input.defaultCooldownSeconds,
     DEFAULT_CONFIG.service.defaultCooldownSeconds,
   )
+  const outboundProxyMode = normalizeOutboundProxyMode(input.outboundProxyMode)
+  const outboundProxyUrl = normalizeProxyUrl(input.outboundProxyUrl)
 
   return {
     enabled: input.enabled !== false,
@@ -394,6 +433,22 @@ function normalizeService(input) {
     collectStreamUsage: input.collectStreamUsage !== false,
     quotaPerCny: toPositiveNumber(input.quotaPerCny, DEFAULT_CONFIG.service.quotaPerCny),
     requestLogLimit: clampInteger(input.requestLogLimit, 200, 3000, DEFAULT_CONFIG.service.requestLogLimit),
+    outboundProxyMode: outboundProxyMode === 'custom' && !outboundProxyUrl ? 'direct' : outboundProxyMode,
+    outboundProxyUrl,
+  }
+}
+
+function assertServicePatch(patch) {
+  const mode = normalizeOutboundProxyMode(patch.outboundProxyMode)
+  if (mode === 'custom' && !normalizeProxyUrl(patch.outboundProxyUrl)) {
+    throw new HttpError(400, 'invalid_service', 'Custom outbound proxy URL must start with http:// or https://.')
+  }
+}
+
+function assertProviderPatch(patch) {
+  const mode = normalizeProviderOutboundProxyMode(patch.outboundProxyMode)
+  if (mode === 'custom' && !normalizeProxyUrl(patch.outboundProxyUrl)) {
+    throw new HttpError(400, 'invalid_provider', 'Custom outbound proxy URL must start with http:// or https://.')
   }
 }
 
@@ -416,6 +471,8 @@ function normalizeProvider(input) {
 
   const credentials = normalizeCredentials(input)
   const activeCredentialId = selectActiveCredentialId(credentials, toText(input.activeCredentialId, ''))
+  const outboundProxyMode = normalizeProviderOutboundProxyMode(input.outboundProxyMode)
+  const outboundProxyUrl = normalizeProxyUrl(input.outboundProxyUrl)
 
   return {
     id: toText(input.id, randomUUID()),
@@ -426,6 +483,8 @@ function normalizeProvider(input) {
     activeCredentialId,
     authMode,
     wireApi,
+    outboundProxyMode: outboundProxyMode === 'custom' && !outboundProxyUrl ? 'inherit' : outboundProxyMode,
+    outboundProxyUrl,
     enabled: input.enabled !== false,
     priority: toNonNegativeInteger(input.priority, 100),
     timeoutMs: toPositiveInteger(input.timeoutMs, DEFAULT_CONFIG.service.requestTimeoutMs),

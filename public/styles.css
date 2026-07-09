@@ -185,7 +185,7 @@ main {
 
 .status-band {
   display: grid;
-  grid-template-columns: 2fr repeat(5, 1fr);
+  grid-template-columns: 2fr repeat(6, 1fr);
   gap: 1px;
   overflow: hidden;
   border: 1px solid var(--line);
@@ -398,6 +398,40 @@ main {
   overflow: auto;
 }
 
+.routing-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 13px 18px;
+  border-bottom: 1px solid var(--line);
+  background: #fbfaf7;
+}
+
+.routing-bar strong {
+  display: block;
+  margin-bottom: 3px;
+}
+
+.routing-bar small {
+  color: var(--muted);
+}
+
+.routing-actions {
+  display: flex;
+  align-items: end;
+  gap: 10px;
+}
+
+.routing-actions label {
+  min-width: 132px;
+}
+
+.routing-actions .ghost:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 .onboarding {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr)) auto;
@@ -512,6 +546,11 @@ td {
   color: var(--warn);
 }
 
+.pill.info {
+  background: #ecebff;
+  color: var(--info);
+}
+
 .pill.off {
   background: #eceff3;
   color: #667085;
@@ -594,6 +633,59 @@ textarea:focus {
   min-width: 58px;
   padding: 0 10px;
   background: #fff;
+}
+
+.outbound-card {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fbfaf7;
+}
+
+.provider-proxy-card {
+  display: grid;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fbfaf7;
+}
+
+.outbound-card .section-head strong,
+.provider-proxy-card .section-head strong {
+  color: var(--ink);
+}
+
+.outbound-card .section-head span,
+.provider-proxy-card .section-head span,
+.inline-hint {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.inline-hint.warn {
+  color: var(--warn);
+}
+
+.proxy-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+}
+
+.proxy-options .radio-label {
+  min-height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fff;
+}
+
+.proxy-options .radio-label input {
+  width: 17px;
+  height: 17px;
 }
 
 dialog {
@@ -948,6 +1040,12 @@ dialog::backdrop {
 
   .onboarding {
     grid-template-columns: 1fr;
+  }
+
+  .routing-bar,
+  .routing-actions {
+    align-items: stretch;
+    flex-direction: column;
   }
 
   .usage-summary,

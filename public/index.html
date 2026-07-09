@@ -49,6 +49,10 @@
           <span class="label">今日 Token</span>
           <strong id="todayTokens">-</strong>
         </div>
+        <div>
+          <span class="label">出站</span>
+          <strong id="outboundState">-</strong>
+        </div>
       </section>
 
       <section class="workspace">
@@ -142,6 +146,23 @@
             </div>
             <button id="newProviderBtn" class="primary" type="button">新增线路</button>
           </div>
+          <div id="routingBar" class="routing-bar">
+            <div>
+              <span class="label">路由起点</span>
+              <strong id="routingStartName">默认优先级</strong>
+              <small id="routingStartHint">自动推进</small>
+            </div>
+            <div class="routing-actions">
+              <label>
+                <span>模式</span>
+                <select id="routingStartMode" class="inline-select">
+                  <option value="auto">自动推进</option>
+                  <option value="locked">锁定起点</option>
+                </select>
+              </label>
+              <button id="clearStartProviderBtn" class="ghost" type="button">清除起点</button>
+            </div>
+          </div>
           <div id="providerEmptyGuide" class="onboarding" hidden>
             <div><strong>1</strong><span>新增中转站，填入 Base URL 与 API Key。</span></div>
             <div><strong>2</strong><span>点测试，自动发现模型并写入线路。</span></div>
@@ -231,6 +252,31 @@
               <span>可切换 HTTP 状态码</span>
               <input name="retryStatusCodes" autocomplete="off">
             </label>
+            <section class="outbound-card wide">
+              <div class="section-head">
+                <strong>出站连接</strong>
+                <span id="outboundEffective">当前：读取中</span>
+              </div>
+              <div class="proxy-options">
+                <label class="radio-label">
+                  <input name="outboundProxyMode" type="radio" value="direct">
+                  <span>直连</span>
+                </label>
+                <label class="radio-label">
+                  <input name="outboundProxyMode" type="radio" value="system">
+                  <span>系统代理</span>
+                </label>
+                <label class="radio-label">
+                  <input name="outboundProxyMode" type="radio" value="custom">
+                  <span>自定义代理</span>
+                </label>
+              </div>
+              <label id="customProxyField">
+                <span>自定义代理地址</span>
+                <input name="outboundProxyUrl" placeholder="http://127.0.0.1:7897" autocomplete="off">
+              </label>
+              <div id="outboundNotice" class="inline-hint"></div>
+            </section>
             <label class="checkline">
               <input name="logRequests" type="checkbox">
               <span>记录最近请求</span>
@@ -440,6 +486,27 @@
             <input name="cooldownSeconds" type="number" min="0">
           </label>
         </div>
+        <section class="provider-proxy-card">
+          <div class="section-head">
+            <strong>出站连接</strong>
+            <span>默认跟随全局设置</span>
+          </div>
+          <div class="two">
+            <label>
+              <span>线路代理</span>
+              <select name="providerOutboundProxyMode">
+                <option value="inherit">跟随全局</option>
+                <option value="direct">直连</option>
+                <option value="system">系统代理</option>
+                <option value="custom">自定义代理</option>
+              </select>
+            </label>
+            <label id="providerCustomProxyField">
+              <span>自定义代理地址</span>
+              <input name="providerOutboundProxyUrl" placeholder="http://127.0.0.1:7897" autocomplete="off">
+            </label>
+          </div>
+        </section>
         <label>
           <span>支持模型</span>
           <textarea name="models" rows="3" placeholder="gpt-4.1, gpt-5.4"></textarea>

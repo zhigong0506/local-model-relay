@@ -5,6 +5,11 @@ import { addUsage, addWindowUsage, createUsageState, emptyUsageBucket, hourKeyFo
 const EMPTY_STATE = {
   version: 1,
   providerState: {},
+  routing: {
+    startProviderId: '',
+    startMode: 'auto',
+    updatedAt: null,
+  },
   requestLog: [],
   usage: createUsageState(),
   upstreamUsage: {},
@@ -12,6 +17,7 @@ const EMPTY_STATE = {
 }
 
 const DEFAULT_REQUEST_LOG_LIMIT = 1500
+const ROUTING_START_MODES = new Set(['auto', 'locked'])
 
 export class StateStore {
   constructor(filePath = statePath) {
@@ -27,6 +33,49 @@ export class StateStore {
 
   getProviderState(providerId) {
     return this.ensureProvider(providerId)
+  }
+
+  getStartProviderId() {
+    return this.state.routing?.startProviderId || ''
+  }
+
+  setStartProvider(providerId, mode) {
+    const startProviderId = toText(providerId)
+    const current = normalizeRouting(this.state.routing)
+    this.state.routing = {
+      startProviderId,
+      startMode: mode === undefined ? current.startMode : normalizeStartMode(mode),
+      updatedAt: new Date().toISOString(),
+    }
+    this.persist()
+    return structuredClone(this.state.routing)
+  }
+
+  advanceStartProvider(providerId) {
+    const current = normalizeRouting(this.state.routing)
+    if (current.startMode !== 'auto') return structuredClone(current)
+
+    const startProviderId = toText(providerId)
+    if (!startProviderId || current.startProviderId === startProviderId) return structuredClone(current)
+
+    this.state.routing = {
+      startProviderId,
+      startMode: 'auto',
+      updatedAt: new Date().toISOString(),
+    }
+    this.persist()
+    return structuredClone(this.state.routing)
+  }
+
+  clearStartProvider() {
+    const current = normalizeRouting(this.state.routing)
+    this.state.routing = {
+      startProviderId: '',
+      startMode: current.startMode,
+      updatedAt: new Date().toISOString(),
+    }
+    this.persist()
+    return structuredClone(this.state.routing)
   }
 
   isCooling(providerId, now = Date.now()) {
@@ -152,6 +201,15 @@ export class StateStore {
       }
     }
 
+    if (this.state.routing?.startProviderId && !keep.has(this.state.routing.startProviderId)) {
+      this.state.routing = {
+        ...normalizeRouting(this.state.routing),
+        startProviderId: '',
+        updatedAt: new Date().toISOString(),
+      }
+      changed = true
+    }
+
     if (changed) this.persist()
     return this.getPublic()
   }
@@ -187,6 +245,7 @@ function normalizeState(value) {
   const state = {
     version: 1,
     providerState: {},
+    routing: normalizeRouting(value?.routing),
     requestLog: Array.isArray(value?.requestLog) ? value.requestLog.slice(0, DEFAULT_REQUEST_LOG_LIMIT) : [],
     usage: createUsageState(value?.usage || { totals: emptyUsageBucket() }),
     upstreamUsage: normalizeUpstreamUsage(value?.upstreamUsage),
@@ -204,6 +263,25 @@ function normalizeState(value) {
   }
 
   return state
+}
+
+function normalizeRouting(value) {
+  const startProviderId = toText(value?.startProviderId)
+  const updatedAt = typeof value?.updatedAt === 'string'
+    ? value.updatedAt
+    : Number.isFinite(Number(value?.updatedAt))
+      ? new Date(Number(value.updatedAt)).toISOString()
+      : null
+  return {
+    startProviderId,
+    startMode: normalizeStartMode(value?.startMode),
+    updatedAt,
+  }
+}
+
+function normalizeStartMode(value) {
+  const mode = typeof value === 'string' ? value.trim().toLowerCase() : ''
+  return ROUTING_START_MODES.has(mode) ? mode : 'auto'
 }
 
 function normalizeRequestLogLimit(value) {
@@ -243,7 +321,7 @@ function normalizeUpstreamUsage(value) {
 }
 
 function toText(value) {
-  return typeof value === 'string' ? value : value == null ? '' : String(value)
+  return typeof value === 'string' ? value.trim() : value == null ? '' : String(value).trim()
 }
 
 function toNumber(value) {
