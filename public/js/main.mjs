@@ -16,6 +16,7 @@ const state = {
   logsPageSize: 20,
   recordsPage: 1,
   recordsPageSize: 20,
+  modelPickers: {},
   dashboardRange: '7d',
   dashboardGranularity: 'day',
   recordsFilter: {
@@ -81,6 +82,8 @@ function bindActions() {
   $('#fetchSpeedModelsBtn').addEventListener('click', fetchSpeedModels)
   $('#clearSpeedTestBtn').addEventListener('click', clearSpeedTestResult)
   formField($('#speedTestForm'), 'proxyMode').addEventListener('change', renderSpeedProxyField)
+  bindModelPicker('speed', { allowCustom: true, emptyText: '先点击“获取模型”，或直接粘贴模型名。' })
+  bindModelPicker('real-test', { allowCustom: false, emptyText: '当前线路没有已保存的支持模型。' })
   $$('[name="outboundProxyMode"]', $('#settingsForm')).forEach((input) => {
     input.addEventListener('change', renderOutboundProxyFields)
   })
@@ -118,6 +121,8 @@ function bindActions() {
   $('#importConfigFile').addEventListener('change', importConfig)
   $('#toggleLocalKeyBtn').addEventListener('click', toggleLocalKeyVisibility)
   $$('.close-dialog').forEach((button) => button.addEventListener('click', () => button.closest('dialog').close()))
+  document.addEventListener('click', closeModelPickersOnOutsideClick)
+  document.addEventListener('keydown', closeModelPickersOnEscape)
 }
 
 async function refreshAll() {
@@ -172,13 +177,11 @@ async function fetchSpeedModels() {
       method: 'POST',
       body: speedTestPayload(form, { includeModel: false }),
     })
-    const options = $('#speedModelOptions')
-    options.innerHTML = (result.models || [])
-      .map((model) => `<option value="${escapeHtml(model)}"></option>`)
-      .join('')
+    setModelPickerOptions('speed', result.models || [])
     if (result.models?.length && !formField(form, 'model').value) {
       formField(form, 'model').value = preferredSpeedModel(result.models)
     }
+    renderModelPicker('speed', true)
     $('#speedTestStatus').textContent = result.ok ? result.message : `获取失败：HTTP ${result.status || 0}`
     toast(result.ok ? `发现 ${result.models.length} 个模型` : `获取模型失败：${result.message}`)
   } catch (error) {
@@ -1464,12 +1467,10 @@ function openRealTestDialog(provider) {
   $('#realTestTimeoutHint').textContent = `本次最多等待 ${formatSeconds(state.config.service.providerRealTestTimeoutMs || 90000)}；不会套用该线路的日常转发超时。`
 
   const models = availableProviderModels(provider)
-  const modelSelect = formField(form, 'model')
-  modelSelect.innerHTML = models.length
-    ? models.map((model) => `<option value="${escapeHtml(model)}">${escapeHtml(model)}</option>`).join('')
-    : '<option value="">暂无已保存的支持模型</option>'
-  modelSelect.disabled = models.length === 0
-  modelSelect.value = preferredRealTestModel(provider)
+  const modelInput = formField(form, 'model')
+  setModelPickerOptions('real-test', models)
+  modelInput.disabled = models.length === 0
+  modelInput.value = preferredRealTestModel(provider)
 
   const enabledCredentials = (provider.credentials || []).filter((credential) => credential.enabled)
   const credentials = enabledCredentials.length ? enabledCredentials : provider.credentials || []
@@ -1528,6 +1529,116 @@ async function runRealTestForForm(form) {
     button.textContent = '运行测试'
     await refreshState()
   }
+}
+
+function bindModelPicker(name, options = {}) {
+  const root = $(`.model-picker[data-picker="${cssEscape(name)}"]`)
+  if (!root) return
+  const input = $('input', root)
+  const list = $('.model-picker-list', root)
+  state.modelPickers[name] = {
+    root,
+    input,
+    list,
+    models: [],
+    allowCustom: options.allowCustom !== false,
+    emptyText: options.emptyText || '没有可选模型。',
+  }
+  input.addEventListener('input', () => renderModelPicker(name, true))
+  input.addEventListener('focus', () => renderModelPicker(name, true))
+  input.addEventListener('keydown', (event) => handleModelPickerKeydown(event, name))
+  list.addEventListener('mousedown', (event) => event.preventDefault())
+  list.addEventListener('click', (event) => {
+    const item = event.target.closest('[data-model]')
+    if (!item) return
+    input.value = item.dataset.model || ''
+    hideModelPicker(name)
+    input.dispatchEvent(new Event('change', { bubbles: true }))
+  })
+}
+
+function setModelPickerOptions(name, models = []) {
+  const picker = state.modelPickers[name]
+  if (!picker) return
+  picker.models = uniqueSorted(models)
+  renderModelPicker(name, false)
+}
+
+function renderModelPicker(name, open = true) {
+  const picker = state.modelPickers[name]
+  if (!picker) return
+  const query = picker.input.value.trim().toLowerCase()
+  const matches = picker.models.filter((model) => model.toLowerCase().includes(query))
+  const visible = query ? matches : picker.models
+  const limited = visible.slice(0, 300)
+  const hiddenCount = Math.max(0, visible.length - limited.length)
+  picker.list.innerHTML = ''
+
+  const meta = document.createElement('div')
+  meta.className = 'model-picker-meta'
+  meta.textContent = picker.models.length
+    ? query
+      ? `匹配 ${visible.length} / ${picker.models.length} 个模型`
+      : `共 ${picker.models.length} 个模型，输入可筛选`
+    : picker.emptyText
+  picker.list.appendChild(meta)
+
+  for (const model of limited) {
+    const item = document.createElement('button')
+    item.type = 'button'
+    item.className = 'model-picker-option'
+    item.dataset.model = model
+    item.textContent = model
+    if (model === picker.input.value) item.classList.add('selected')
+    picker.list.appendChild(item)
+  }
+
+  if (hiddenCount > 0) {
+    const more = document.createElement('div')
+    more.className = 'model-picker-meta'
+    more.textContent = `还有 ${hiddenCount} 个结果，请继续输入缩小范围。`
+    picker.list.appendChild(more)
+  }
+
+  if (picker.allowCustom && query && !picker.models.includes(picker.input.value)) {
+    const custom = document.createElement('div')
+    custom.className = 'model-picker-meta'
+    custom.textContent = '未匹配到也可以直接使用当前输入。'
+    picker.list.appendChild(custom)
+  }
+
+  picker.list.hidden = !open
+}
+
+function handleModelPickerKeydown(event, name) {
+  const picker = state.modelPickers[name]
+  if (!picker) return
+  if (event.key === 'Escape') {
+    hideModelPicker(name)
+    return
+  }
+  if (event.key !== 'Enter' || picker.list.hidden) return
+  const selected = $('.model-picker-option.selected, .model-picker-option', picker.list)
+  if (!selected) return
+  event.preventDefault()
+  picker.input.value = selected.dataset.model || ''
+  hideModelPicker(name)
+}
+
+function hideModelPicker(name) {
+  const picker = state.modelPickers[name]
+  if (picker) picker.list.hidden = true
+}
+
+function closeModelPickersOnOutsideClick(event) {
+  for (const [name, picker] of Object.entries(state.modelPickers)) {
+    if (!picker.root.contains(event.target)) hideModelPicker(name)
+  }
+}
+
+function closeModelPickersOnEscape(event) {
+  if (event.key !== 'Escape') return
+  Object.keys(state.modelPickers).forEach(hideModelPicker)
 }
 
 function renderRealTestResult(result = null) {

@@ -232,8 +232,10 @@
               <div class="speed-model-row">
                 <label>
                   <span>模型</span>
-                  <input name="model" list="speedModelOptions" required autocomplete="off" placeholder="先获取模型，或直接粘贴模型名">
-                  <datalist id="speedModelOptions"></datalist>
+                  <div class="model-picker" data-picker="speed">
+                    <input id="speedModelInput" name="model" required autocomplete="off" placeholder="先获取模型，或直接粘贴模型名">
+                    <div id="speedModelList" class="model-picker-list" role="listbox" hidden></div>
+                  </div>
                 </label>
                 <button id="fetchSpeedModelsBtn" class="ghost" type="button">获取模型</button>
               </div>
@@ -734,7 +736,10 @@
         <div class="two">
           <label>
             <span>模型</span>
-            <select name="model" required></select>
+            <div class="model-picker" data-picker="real-test">
+              <input id="realTestModelInput" name="model" required autocomplete="off" placeholder="输入筛选或粘贴模型名">
+              <div id="realTestModelList" class="model-picker-list" role="listbox" hidden></div>
+            </div>
           </label>
           <label>
             <span>上游协议</span>

@@ -23,6 +23,7 @@ It is a personal desktop tool, not a multi-user gateway or billing platform.
 - Codex-compatible Responses text streams, function calls, tool results, and
   reconnect circuit breaking
 - Quick connectivity tests, model-aware real tests, and ad-hoc endpoint speed tests
+- Searchable model pickers for large speed-test and real-test model lists
 - Request records, pagination, date filters, Token charts, and cache-Token diagnostics
 - Configuration import/export with masked-secret export by default
 - No runtime dependencies, build step, or external database

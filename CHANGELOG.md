@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.2 - 2026-07-11
+
+- Replaced native model dropdowns with searchable in-app model pickers for
+  speed tests and provider real tests, so large model lists can be filtered
+  without browser `select` or `datalist` display limits.
+- Added a UI regression check that verifies the searchable picker replaces the
+  native controls.
+
 ## 0.2.1 - 2026-07-11
 
 - Added a long-task quota-exhaustion regression test: a provider completes
