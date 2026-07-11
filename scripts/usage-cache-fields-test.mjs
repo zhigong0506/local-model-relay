@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -7,7 +8,7 @@ import { normalizeUsagePayload } from '../src/wire-api.mjs'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const workDir = resolve(root, 'work')
-const stateFile = resolve(workDir, `usage-cache-fields-${Date.now()}.json`)
+const stateFile = resolve(workDir, `usage-cache-fields-${process.pid}-${randomUUID()}.json`)
 
 mkdirSync(workDir, { recursive: true })
 
@@ -36,7 +37,9 @@ try {
   assert.equal(explicitZero.cachedTokens, 0)
   assert.equal(explicitZero.cachedTokensReported, true)
 
-  const oldTimestamp = Date.parse('2026-07-10T02:30:00+08:00')
+  // Keep the sample away from midnight so the assertion is stable on UTC CI
+  // runners as well as on the user's local timezone.
+  const oldTimestamp = Date.parse('2026-07-10T12:30:00+08:00')
   writeFileSync(stateFile, JSON.stringify({
     version: 1,
     requestLog: [{
@@ -72,7 +75,7 @@ try {
   assert.equal(state.usage.dailyByModel['upstream-test']['2026-07-10'].cachedTokens, 40)
   assert.equal(state.usage.dailyByProvider['历史线路']['2026-07-10'].latencySum, 250)
 
-  const nextTimestamp = Date.parse('2026-07-10T03:15:00+08:00')
+  const nextTimestamp = Date.parse('2026-07-10T13:15:00+08:00')
   store.recordUsage('provider-id', 'upstream-test', {
     inputTokens: 80,
     outputTokens: 10,
