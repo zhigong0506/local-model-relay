@@ -1,35 +1,39 @@
 # Local Model Relay
 
-Local Model Relay 是一个零构建的本地模型中转控制台。它把多个 OpenAI-compatible 上游服务收拢到一个本地 `/v1` 接口后面，让你可以在浏览器里管理线路优先级、模型路由、故障转移、请求记录和 Token 用量。
+[English](README.md)
 
-这个项目面向个人本地使用，不包含多用户、计费、支付或账号共享功能。
+[![Node.js CI](https://github.com/zhigong0506/local-model-relay/actions/workflows/node.js.yml/badge.svg)](https://github.com/zhigong0506/local-model-relay/actions/workflows/node.js.yml)
+[![Node.js 20+](https://img.shields.io/badge/Node.js-20%2B-339933)](https://nodejs.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-## 主要功能
+Local Model Relay 是一个零构建、面向个人使用的本地模型中转控制台。它把多个
+OpenAI-compatible 上游线路收拢到一个本地 `/v1` 端口，并在浏览器中统一管理线路、
+模型路由、故障转移、测试、请求记录和 Token 用量。
 
-- 本地管理界面：`http://127.0.0.1:25818/admin`
-- 本地 OpenAI-compatible API：`http://127.0.0.1:25818/v1`
-- 多上游线路管理：优先级、超时、冷却、模型列表、凭据分组
-- 模型路由：虚拟模型名映射到多条真实线路目标
-- 自动故障转移：遇到 `401`、`403`、`429`、`500`、`502`、`503`、`504` 等错误时自动尝试下一条线路
-- 路由起点：可手动指定从某条线路开始故障转移，支持自动推进或锁定不变
-- 出站代理：支持全局直连、系统代理、自定义代理，也支持单条线路覆盖
-- Chat Completions 和 Responses 协议转换
-- 仪表盘：请求量、Token 趋势、模型分布、最近用量
-- 请求记录：筛选、排序、CSV 导出、清空记录
-- Token 用量统计：支持上游 usage，也支持无 usage 时的本地估算
-- 端到端测试脚本：故障转移测试和 usage 估算测试
-- 无构建、无 npm 依赖、无外部数据库
+它不是多用户网关、计费系统或账号共享平台。
+
+## 主要能力
+
+- 线路优先级、Key 分组、支持模型、超时、冷却时间和备注管理
+- 全局与单线路直连、系统代理、自定义代理设置
+- 模型路由自动跟随线路优先级，并自动加入支持相同模型的线路
+- Chat Completions 与 Responses 协议转换
+- 对可重试 HTTP 状态码、网络错误和流式异常进行逐级故障转移
+- Codex Responses 文本流、函数调用、工具结果回传和重连熔断兼容
+- 快速连通测试、可选模型的真实测试、临时端口速度测试
+- 请求记录分页、日期筛选、Token 趋势与模型/线路占比图
+- 缓存 Token 上报状态诊断和无 usage 时的本地估算
+- 默认脱敏的配置导入导出
+- 无运行时 npm 依赖、无构建步骤、无外部数据库
 
 ## 环境要求
 
 - Node.js 20 或更高版本
-- Git（如果你希望通过克隆仓库安装）
+- 通过 `git clone` 安装时需要 Git
 
-项目没有运行时 npm 依赖，所以克隆后不需要执行 `npm install`。
+项目没有运行时 npm 依赖，因此克隆后不需要执行 `npm install`。
 
 ## 安装
-
-从 GitHub 克隆并启动：
 
 ```powershell
 git clone https://github.com/zhigong0506/local-model-relay.git
@@ -37,190 +41,141 @@ cd local-model-relay
 npm start
 ```
 
-然后打开：
+打开 `http://127.0.0.1:25818/admin`，本地 API 地址为：
 
 ```text
-http://127.0.0.1:25818/admin
+http://127.0.0.1:25818/v1
 ```
 
-Windows 下可以在克隆后创建桌面快捷方式：
+Windows 用户可以创建桌面快捷方式：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\create-shortcut.ps1
 ```
 
-它会创建用于打开和停止 Local Model Relay 的快捷方式。
+脚本会自动识别当前克隆目录，不包含作者电脑路径。也可以直接双击
+`open-control-panel.vbs` 启动并打开管理界面。
 
-## 快速开始
+## 第一次使用
 
-确保本机已经安装 Node.js 20 或更高版本。
+1. 在线路页新增 Base URL 和 API Key。
+2. 选择上游协议：Chat Completions、Responses 或自动跟随。
+3. 运行快速测试，并按需保存发现的模型。
+4. 从该线路已保存的模型中选择一个进行真实测试。
+5. 检查自动同步生成的模型路由和线路顺序。
+6. 把客户端指向本地接口。
+
+默认客户端参数：
+
+```text
+base_url = http://127.0.0.1:25818/v1
+api_key  = local-relay
+```
+
+如果电脑可能被其他人使用，建议先在设置页修改本地 API Key。
+
+## Codex 接入
+
+在 `~/.codex/config.toml` 中添加自定义 provider。Windows 路径通常是
+`%USERPROFILE%\.codex\config.toml`：
+
+```toml
+model_provider = "local_model_relay"
+model = "你的虚拟模型名"
+
+[model_providers.local_model_relay]
+name = "Local Model Relay"
+base_url = "http://127.0.0.1:25818/v1"
+wire_api = "responses"
+env_key = "LOCAL_RELAY_API_KEY"
+requires_openai_auth = false
+```
+
+启动 Codex 前设置对应环境变量：
 
 ```powershell
+$env:LOCAL_RELAY_API_KEY = "local-relay"
+```
+
+`env_key` 指向本地接口 Key 所在的环境变量；自定义兼容端口建议保持
+`requires_openai_auth = false`，避免把 Codex 账号登录凭据替代成本地接口 Key。
+字段定义可参考 [Codex 官方配置 Schema](https://github.com/openai/codex/blob/main/codex-rs/core/config.schema.json)。
+
+### Codex 无感故障转移
+
+- 在真正输出内容前遇到 HTTP 错误、`response.failed`、`error`、不完整起始流或
+  上游长时间无输出时，本地会在同一个请求内尝试下一条线路。
+- 这类切换不需要重新输入“继续”，也不需要 Codex 创建新回合。
+- 已经向 Codex 输出有效正文后，本地不会把另一条线路的回答拼接进原流，以免破坏
+  工具调用。故障线路会进入冷却，Codex 下一次自动重连会跳过它。
+- 连续未完成重连达到阈值后会触发更长冷却，避免反复撞上已限额或持续异常的线路。
+
+## 路由与线路测试
+
+模型路由把一个客户端模型名映射到多条线路。线路按优先级从小到大尝试，可选择：
+
+- 自动推进：最近成功线路成为后续请求起点。
+- 锁定起点：每次都从指定线路开始，再按顺序故障转移。
+
+测试分为三类：
+
+- 快速测试：请求 `/v1/models`，默认最多等待 30 秒。
+- 真实测试：选择线路已有模型发起一次真实请求，默认最多等待 90 秒。
+- 速度测试：临时输入 URL、Key 和模型，多轮测量首字延迟、总耗时和输出速度。
+
+测试时限与线路日常转发超时相互独立，避免线路误填 1 秒后出现“上游成功、本地失败”。
+
+## 数据与隐私
+
+运行后会在本地创建：
+
+```text
+data/config.json   线路配置和 API Key
+data/state.json    线路状态、请求记录和用量
+logs/              后台启动日志
+work/              兼容性测试临时数据
+```
+
+这些目录均已加入 `.gitignore`。API Key 为了简单可靠会以明文 JSON 保存在本机。
+导出配置默认脱敏，只有用户主动选择时才会包含完整密钥。
+
+请保持监听地址为 `127.0.0.1`。管理 API 还会校验访问方是否为本机回环地址，但本项目
+仍不适合作为公网服务直接部署。
+
+## 更新与停止
+
+更新代码：
+
+```powershell
+git pull --ff-only
 npm start
 ```
 
-然后打开：
+前台运行时按 `Ctrl+C` 停止。Windows 用户也可以使用 `stop.bat` 或停止快捷方式。
 
-```text
-http://127.0.0.1:25818/admin
-```
-
-默认本地接口配置：
-
-```text
-base_url = http://127.0.0.1:25818/v1
-api_key  = local-relay
-```
-
-## 客户端接入
-
-任何支持 OpenAI-compatible 接口的客户端都可以接入本地端口。
-
-示例：
-
-```text
-base_url = http://127.0.0.1:25818/v1
-api_key  = local-relay
-model    = 你在模型路由中配置的虚拟模型名
-```
-
-测试模型列表：
+## 全量测试
 
 ```powershell
-curl http://127.0.0.1:25818/v1/models -H "Authorization: Bearer local-relay"
+npm run test:all
 ```
 
-## 配置文件
+测试覆盖状态码故障转移、流内失败和空闲流切线、Codex 文本/工具协议、重连熔断、
+路由起点、出站代理、缓存字段、usage 估算和真实测试模型选择。
 
-运行时配置位于：
+端到端测试会使用随机本地端口和临时数据目录，不会修改用户正在使用的线路、路由、
+请求记录或 Token 统计。
 
-```text
-data/config.json
-```
+## 已知边界
 
-运行状态和请求记录位于：
-
-```text
-data/state.json
-```
-
-这两个文件默认不会提交到 git，因为它们可能包含 API Key、上游地址、请求记录或本地使用数据。
-
-仓库里只提供安全模板：
-
-```text
-data/config.example.json
-```
-
-首次使用时，可以参考这个模板从管理界面添加自己的线路配置。
-
-## 模型路由与故障转移
-
-模型路由用于把客户端请求的虚拟模型名映射到多条真实上游线路。
-
-例如：
-
-```text
-my-gpt-model
-  -> Provider A / gpt-example
-  -> Provider B / gpt-example
-  -> Provider C / gpt-example
-```
-
-当 Provider A 返回可重试错误或网络失败时，本地代理会自动尝试 Provider B，然后再尝试 Provider C。
-
-模型路由会自动跟随线路优先级排序。如果某条线路声明支持某个模型，保存线路后会自动加入对应模型路由。
-
-线路页可以把某条线路设为“路由起点”。`auto` 模式下，最近一次成功线路会成为下一次请求的起点；`locked` 模式下，起点不会被成功请求自动改写。
-
-## 出站代理
-
-设置页可以选择全局出站模式：
-
-- `direct`：直连
-- `system`：使用系统代理
-- `custom`：使用自定义 HTTP/HTTPS 代理
-
-线路编辑页也可以单独指定代理模式。这样可以让某些线路直连，另一些线路走国外代理，而本地 `/admin` 和 `/v1` 入站访问始终保持本机访问。
-
-## 协议转换
-
-每条线路可以配置为：
-
-- `chat`：Chat Completions
-- `responses`：Responses
-- `auto`：跟随客户端请求协议
-
-当客户端和上游协议不一致时，Local Model Relay 会尽量进行基础转换。例如客户端使用 Chat Completions，而某条上游只适合 Responses，代理会转换请求和响应。
-
-## Token 用量
-
-项目会优先读取上游响应里的 `usage` 字段。
-
-如果上游没有返回 usage，或者客户端在流式响应结束前断开，项目会生成一个本地估算值，并在前端标记为“估算”。估算值只用于本地观察，不应视为上游精确计费结果。
-
-## 测试
-
-语法检查：
-
-```powershell
-npm run check
-```
-
-故障转移端到端测试：
-
-```powershell
-npm run test:failover
-```
-
-usage 估算端到端测试：
-
-```powershell
-npm run test:usage-estimate
-```
-
-出站代理测试：
-
-```powershell
-npm run test:outbound-proxy
-```
-
-路由起点测试：
-
-```powershell
-npm run test:sticky-routing
-```
-
-这些测试会临时启动本地 mock 上游，调用真实的本地 `/v1` 接口，并在结束后清理临时线路和模型路由。
+- 上游兼容性仍取决于中转站对 Chat Completions 或 Responses 格式的实现程度。
+- 缓存 Token 只能读取上游返回的 usage 字段，本地无法凭空得知真实缓存命中量。
+- 项目不提供多用户权限、计费、支付、Key 加密或账号共享功能。
 
 ## 安全说明
 
-- 不要提交 `data/config.json`
-- 不要提交 `data/state.json`
-- 不要把包含明文 API Key 的导出配置发布到公开仓库
-- 默认实现为了简单可靠，会把 API Key 保存在本机 JSON 文件里
-- 如果需要多人环境或更强安全性，建议接入系统密钥库或本机加密机制
+详见 [SECURITY.md](SECURITY.md)。公开问题、截图和日志中不要包含真实 API Key、代理密码、
+私有线路地址或完整配置导出文件。
 
-## 桌面启动
+## 开源许可
 
-Windows 下可以使用：
-
-```text
-open-control-panel.vbs
-start-hidden.vbs
-stop.bat
-```
-
-也可以运行：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\create-shortcut.ps1
-```
-
-来创建桌面快捷方式。
-
-## 项目定位
-
-Local Model Relay 是一个个人本地工具，目标是让多个模型服务入口变得更稳定、更容易观察、更容易切换。
-
-它不提供公开服务端能力，不负责多用户隔离、余额管理、支付、分销或账号共享。
+[MIT License](LICENSE)

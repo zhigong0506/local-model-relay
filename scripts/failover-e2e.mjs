@@ -6,12 +6,14 @@ const model = `failover-e2e-${stamp}`
 const hits = []
 const createdProviders = []
 let createdRouteId = ''
+let originalMaxAttempts = null
 
 const scenarios = [
   { name: 'E2E 01 502', status: 502, message: 'mock 502 from first provider' },
   { name: 'E2E 02 503', status: 503, message: 'mock 503 from second provider' },
   { name: 'E2E 03 403', status: 403, message: 'mock 403 from third provider' },
-  { name: 'E2E 04 OK', status: 200, message: 'FAILOVER_OK' },
+  { name: 'E2E 04 402', status: 402, message: 'mock 402 from fourth provider' },
+  { name: 'E2E 05 OK', status: 200, message: 'FAILOVER_OK' },
 ]
 
 const servers = await Promise.all(scenarios.map(startMockUpstream))
@@ -19,6 +21,13 @@ const servers = await Promise.all(scenarios.map(startMockUpstream))
 try {
   const config = await api('/api/config')
   const localKey = config.service.localApiKey
+  originalMaxAttempts = config.service.maxAttempts
+  if (originalMaxAttempts < scenarios.length) {
+    await api('/api/service', {
+      method: 'PATCH',
+      body: { maxAttempts: scenarios.length },
+    })
+  }
 
   for (let index = 0; index < scenarios.length; index += 1) {
     const scenario = scenarios[index]
@@ -59,7 +68,7 @@ try {
   const report = {
     ok: result.status === 200 &&
       result.text === 'FAILOVER_OK' &&
-      result.attemptsHeader === '4' &&
+      result.attemptsHeader === String(scenarios.length) &&
       hits.map((hit) => hit.name).join('|') === scenarios.map((item) => item.name).join('|'),
     model,
     responseStatus: result.status,
@@ -158,6 +167,15 @@ async function cleanup() {
   for (const provider of createdProviders.reverse()) {
     try {
       await api(`/api/providers/${provider.id}`, { method: 'DELETE' })
+    } catch {}
+  }
+
+  if (originalMaxAttempts !== null) {
+    try {
+      await api('/api/service', {
+        method: 'PATCH',
+        body: { maxAttempts: originalMaxAttempts },
+      })
     } catch {}
   }
 

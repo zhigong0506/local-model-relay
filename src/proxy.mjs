@@ -24,7 +24,12 @@ const HOP_BY_HOP_HEADERS = new Set([
 
 const MAX_REQUEST_BODY_BYTES = 25 * 1024 * 1024
 const MAX_USAGE_SNIFF_BYTES = 10 * 1024 * 1024
+const MAX_STREAM_INSPECT_CHARS = 1024 * 1024
+const MAX_STREAM_PRELUDE_BYTES = 256 * 1024
 const CLIENT_ABORTED_CODE = 'CLIENT_ABORTED'
+const UPSTREAM_STREAM_FAILED_CODE = 'UPSTREAM_STREAM_FAILED'
+const UPSTREAM_STREAM_INCOMPLETE_CODE = 'UPSTREAM_STREAM_INCOMPLETE'
+const UPSTREAM_STREAM_IDLE_CODE = 'UPSTREAM_STREAM_IDLE_TIMEOUT'
 const APPROX_CHARS_PER_TOKEN = 4
 
 export async function handleProxyRequest(req, res, context) {
@@ -51,14 +56,19 @@ export async function handleProxyRequest(req, res, context) {
   }
 
   if (req.method === 'GET' && req.url.startsWith('/v1/models')) {
+    const models = listModels(config)
     return sendJson(res, 200, {
       object: 'list',
-      data: listModels(config).map((model) => ({
+      data: models.map((model) => ({
         id: model,
         object: 'model',
         created: 0,
         owned_by: 'local-model-relay',
       })),
+      // Codex currently expects its private model catalog envelope. An empty
+      // remote catalog keeps Codex's bundled metadata while preserving the
+      // standard OpenAI-compatible `data` list for other clients.
+      models: [],
     })
   }
 
@@ -129,9 +139,10 @@ export async function handleProxyRequest(req, res, context) {
       attempt.status = upstreamResponse.status
       attempt.latencyMs = latencyMs
       let capturedUsage = null
+      let streamInfo = null
 
       if (shouldRetryStatus(upstreamResponse.status, config.service.retryStatusCodes)) {
-        const message = await readPreview(upstreamResponse)
+        const message = await readPreview(upstreamResponse, upstream.abort, candidate.provider.timeoutMs)
         attempt.error = message
         stateStore.markFailure(candidate.provider.id, {
           status: upstreamResponse.status,
@@ -145,18 +156,50 @@ export async function handleProxyRequest(req, res, context) {
 
       const ok = upstreamResponse.status < 400
       try {
-        capturedUsage = await pipeUpstreamResponse(upstreamResponse, res, candidate, attempts.length, upstream.abort, {
+        const piped = await pipeUpstreamResponse(upstreamResponse, res, candidate, attempts.length, upstream.abort, {
           collectUsage: config.service.collectUsage,
           requestBody: body,
           wirePlan: upstream.wirePlan,
         })
+        capturedUsage = piped.usage
+        streamInfo = piped.stream
       } catch (streamError) {
         upstream.abort()
         const message = streamError instanceof Error ? streamError.message : String(streamError)
         capturedUsage = capturedUsage || streamError?.usage || null
-        attempt.error = message
+        streamInfo = streamInfo || streamError?.stream || null
+        if (streamError?.code === UPSTREAM_STREAM_FAILED_CODE) attempt.outcome = 'upstream_stream_failed'
+        if (streamError?.code === UPSTREAM_STREAM_INCOMPLETE_CODE) attempt.outcome = 'upstream_stream_incomplete'
+        if (streamError?.code === UPSTREAM_STREAM_IDLE_CODE) attempt.outcome = 'upstream_stream_idle_timeout'
+        const outcome = streamError?.code === CLIENT_ABORTED_CODE
+          ? classifyClientAbort(streamInfo)
+          : ''
+        const semanticallyComplete = streamError?.code === CLIENT_ABORTED_CODE &&
+          ok &&
+          outcome !== 'client_disconnected'
+        attempt.error = semanticallyComplete ? '' : message
+        attempt.outcome = outcome
 
         if (streamError?.code === CLIENT_ABORTED_CODE) {
+          if (semanticallyComplete) {
+            stateStore.markSuccess(candidate.provider.id, {
+              status: upstreamResponse.status,
+              latencyMs,
+            })
+            stateStore.advanceStartProvider?.(candidate.provider.id)
+          } else {
+            const reconnect = stateStore.markReconnectFailure?.(candidate.provider.id, {
+              status: upstreamResponse.status,
+              message,
+              latencyMs: Date.now() - attempt.startedAt,
+              threshold: config.service.reconnectFailureThreshold,
+              cooldownSeconds: config.service.reconnectCooldownSeconds,
+              windowSeconds: 300,
+            })
+            attempt.reconnectFailureCount = reconnect?.count || 0
+            attempt.reconnectFailureThreshold = reconnect?.threshold || config.service.reconnectFailureThreshold
+            attempt.failoverArmed = Boolean(reconnect?.tripped)
+          }
           if (capturedUsage) {
             stateStore.recordUsage(candidate.provider.id, candidate.model, capturedUsage, {
               credentialId: attempt.credentialId,
@@ -168,12 +211,15 @@ export async function handleProxyRequest(req, res, context) {
             path: req.url,
             model: virtualModel,
             routedModel: candidate.model,
+            providerId: candidate.provider.id,
             providerName: candidate.provider.name,
             status: upstreamResponse.status,
-            ok: false,
+            ok: semanticallyComplete,
             attempts: attempts.map(publicAttempt),
             durationMs: Date.now() - startedAt,
-            error: message,
+            error: semanticallyComplete ? undefined : message,
+            outcome,
+            stream: streamInfo,
             usage: capturedUsage,
           })
           return
@@ -191,6 +237,7 @@ export async function handleProxyRequest(req, res, context) {
           path: req.url,
           model: virtualModel,
           routedModel: candidate.model,
+          providerId: candidate.provider.id,
           providerName: candidate.provider.name,
           status: upstreamResponse.status || 0,
           ok: false,
@@ -235,11 +282,14 @@ export async function handleProxyRequest(req, res, context) {
         path: req.url,
         model: virtualModel,
         routedModel: candidate.model,
+        providerId: candidate.provider.id,
         providerName: candidate.provider.name,
         status: upstreamResponse.status,
         ok,
         attempts: attempts.map(publicAttempt),
         durationMs: Date.now() - startedAt,
+        outcome: ok ? 'completed' : 'upstream_error',
+        stream: streamInfo,
         usage: ok ? capturedUsage : null,
       })
       return
@@ -379,14 +429,22 @@ function buildHeaders(source, provider) {
   return headers
 }
 
-async function readPreview(response) {
+async function readPreview(response, abortUpstream, timeoutMs = 30000) {
   const contentType = response.headers.get('content-type') || ''
   let text = ''
+  let timedOut = false
+  const timeout = setTimeout(() => {
+    timedOut = true
+    abortUpstream?.()
+  }, timeoutMs)
 
   try {
     text = await response.text()
   } catch {
+    if (timedOut) return `HTTP ${response.status} response body timed out after ${timeoutMs} ms.`
     return `HTTP ${response.status}`
+  } finally {
+    clearTimeout(timeout)
   }
 
   const trimmed = text.replace(/\s+/g, ' ').trim()
@@ -413,50 +471,250 @@ async function pipeUpstreamResponse(upstreamResponse, res, candidate, attemptsCo
   res.setHeader('x-local-relay-attempts', String(attemptsCount))
 
   if (options.wirePlan?.transform) {
-    return transformWireResponse(upstreamResponse, res, options.wirePlan)
+    const usage = await transformWireResponse(upstreamResponse, res, options.wirePlan)
+    return { usage, stream: null }
   }
 
   if (!upstreamResponse.body) {
     res.end()
-    return null
+    return { usage: null, stream: null }
   }
 
   const usageCollector = createUsageCollector(upstreamResponse, options.collectUsage, options.requestBody)
+  const streamInspector = createStreamInspector(upstreamResponse)
   const clientAbort = new AbortController()
   let clientDisconnected = false
+  let idleTimedOut = false
+  let idleTimeout = null
+  let streamCommitted = !streamInspector.snapshot().isStream
+  let preludeBytes = 0
+  const preludeChunks = []
+
+  const flushPrelude = async () => {
+    if (streamCommitted && preludeChunks.length === 0) return
+    streamCommitted = true
+    for (const chunk of preludeChunks.splice(0)) {
+      await writeResponseChunk(res, chunk)
+    }
+  }
+
+  const armIdleTimeout = () => {
+    clearTimeout(idleTimeout)
+    idleTimeout = setTimeout(() => {
+      idleTimedOut = true
+      abortUpstream?.()
+    }, candidate.provider.timeoutMs)
+  }
   const onClientClose = () => {
     if (res.writableEnded) return
     clientDisconnected = true
     abortUpstream?.()
-    clientAbort.abort(makeClientAbortedError(usageCollector.usage || usageCollector.estimate()))
+    clientAbort.abort(makeClientAbortedError(
+      usageCollector.usage || usageCollector.estimate(),
+      streamInspector.snapshot(),
+    ))
   }
 
   res.once('close', onClientClose)
+  armIdleTimeout()
 
   try {
     await upstreamResponse.body.pipeTo(new WritableStream({
-      write(chunk) {
+      async write(chunk) {
+        armIdleTimeout()
         usageCollector.ingest(chunk)
-        return writeResponseChunk(res, chunk)
+        streamInspector.ingest(chunk)
+        if (streamCommitted) return writeResponseChunk(res, chunk)
+
+        const buffered = Buffer.from(chunk)
+        preludeChunks.push(buffered)
+        preludeBytes += buffered.length
+        const snapshot = streamInspector.snapshot()
+
+        if (snapshot.failureReason) {
+          throw makeUpstreamStreamError(snapshot.failureReason, snapshot)
+        }
+        if (snapshot.sawMeaningfulOutput || streamCompletionReason(snapshot) || preludeBytes >= MAX_STREAM_PRELUDE_BYTES) {
+          await flushPrelude()
+        }
       },
-      close() {
+      async close() {
+        clearTimeout(idleTimeout)
         usageCollector.finish()
+        streamInspector.finish()
+        const snapshot = streamInspector.snapshot()
+        if (snapshot.failureReason) {
+          throw makeUpstreamStreamError(snapshot.failureReason, snapshot)
+        }
+        if (snapshot.isStream && !streamCompletionReason(snapshot)) {
+          throw makeUpstreamStreamIncompleteError(snapshot)
+        }
+        await flushPrelude()
         if (!res.writableEnded) res.end()
       },
       abort(error) {
-        if (!res.destroyed) res.destroy(error)
+        if (res.headersSent && !res.destroyed) res.destroy(error)
       },
     }), { signal: clientAbort.signal })
   } catch (error) {
+    streamInspector.finish()
+    const snapshot = streamInspector.snapshot()
     if (clientDisconnected || error?.code === CLIENT_ABORTED_CODE) {
-      throw makeClientAbortedError(usageCollector.usage || usageCollector.estimate())
+      throw makeClientAbortedError(
+        usageCollector.usage || usageCollector.estimate(),
+        snapshot,
+      )
+    }
+    if (idleTimedOut) {
+      throw makeUpstreamStreamIdleError(candidate.provider.timeoutMs, snapshot, usageCollector.usage || usageCollector.estimate())
+    }
+    if (error && typeof error === 'object') {
+      error.usage ??= usageCollector.usage || usageCollector.estimate()
+      error.stream ??= snapshot
     }
     throw error
   } finally {
+    clearTimeout(idleTimeout)
     res.off('close', onClientClose)
   }
 
-  return usageCollector.usage
+  return {
+    usage: usageCollector.usage,
+    stream: streamInspector.snapshot(),
+  }
+}
+
+function createStreamInspector(response) {
+  const contentType = response.headers.get('content-type') || ''
+  const isStream = contentType.includes('text/event-stream')
+  let buffer = ''
+  let disabled = false
+  const state = {
+    contentType,
+    isStream,
+    bytes: 0,
+    chunks: 0,
+    eventCount: 0,
+    lastEventType: '',
+    sawResponseCompleted: false,
+    sawDoneSentinel: false,
+    sawToolCallDone: false,
+    sawOutputDone: false,
+    sawChatFinish: false,
+    sawMeaningfulOutput: false,
+    failureReason: '',
+  }
+
+  const processText = (text) => {
+    for (const line of text.split(/\r?\n/)) {
+      const trimmed = line.trim()
+      if (!trimmed.startsWith('data:')) continue
+      const data = trimmed.slice(5).trim()
+      if (!data) continue
+      if (data === '[DONE]') {
+        state.sawDoneSentinel = true
+        state.lastEventType = '[DONE]'
+        continue
+      }
+      if (!data.startsWith('{')) continue
+
+      try {
+        const payload = JSON.parse(data)
+        const type = typeof payload?.type === 'string' ? payload.type : ''
+        if (type) {
+          state.eventCount += 1
+          state.lastEventType = type
+        }
+        if (type === 'response.completed' || payload?.response?.status === 'completed') {
+          state.sawResponseCompleted = true
+        }
+        if (type === 'response.failed' || type === 'error' || payload?.response?.status === 'failed' || payload?.error) {
+          state.failureReason = streamFailureMessage(payload, type)
+        }
+        if (isMeaningfulStreamPayload(payload, type)) {
+          state.sawMeaningfulOutput = true
+        }
+        if (
+          type === 'response.function_call_arguments.done' ||
+          (type === 'response.output_item.done' && payload?.item?.type === 'function_call')
+        ) {
+          state.sawToolCallDone = true
+        }
+        if (type === 'response.output_text.done' || type === 'response.refusal.done') {
+          state.sawOutputDone = true
+        }
+        if (Array.isArray(payload?.choices) && payload.choices.some((choice) => choice?.finish_reason)) {
+          state.sawChatFinish = true
+          if (payload.choices.some((choice) => choice?.finish_reason === 'tool_calls')) {
+            state.sawToolCallDone = true
+          }
+        }
+      } catch {}
+    }
+  }
+
+  return {
+    ingest(chunk) {
+      const bytes = chunk.byteLength ?? chunk.length ?? 0
+      state.bytes += bytes
+      state.chunks += 1
+      if (!isStream || disabled) return
+
+      buffer += Buffer.from(chunk).toString('utf8')
+      if (buffer.length > MAX_STREAM_INSPECT_CHARS) {
+        disabled = true
+        buffer = ''
+        return
+      }
+
+      const lastNewline = buffer.lastIndexOf('\n')
+      if (lastNewline < 0) return
+      processText(buffer.slice(0, lastNewline + 1))
+      buffer = buffer.slice(lastNewline + 1)
+    },
+    finish() {
+      if (!disabled && buffer) processText(buffer)
+      buffer = ''
+    },
+    snapshot() {
+      return {
+        ...state,
+        completionReason: streamCompletionReason(state),
+      }
+    },
+  }
+}
+
+function streamCompletionReason(stream) {
+  if (stream?.sawResponseCompleted || stream?.sawDoneSentinel || stream?.sawOutputDone) {
+    return 'response_complete'
+  }
+  if (stream?.sawToolCallDone) return 'tool_call_handoff'
+  if (stream?.sawChatFinish) return 'response_complete'
+  return ''
+}
+
+function classifyClientAbort(stream) {
+  return streamCompletionReason(stream) || 'client_disconnected'
+}
+
+function isMeaningfulStreamPayload(payload, type) {
+  if (type === 'response.output_text.delta' || type === 'response.refusal.delta' || type === 'response.function_call_arguments.delta') {
+    return Boolean(payload?.delta)
+  }
+  if (type.includes('reasoning') && type.endsWith('.delta')) {
+    return Boolean(payload?.delta || payload?.text)
+  }
+  if (!Array.isArray(payload?.choices)) return false
+  return payload.choices.some((choice) => {
+    const delta = choice?.delta
+    return Boolean(delta?.content || delta?.refusal || (Array.isArray(delta?.tool_calls) && delta.tool_calls.length))
+  })
+}
+
+function streamFailureMessage(payload, type) {
+  const message = payload?.error?.message || payload?.response?.error?.message || payload?.message
+  return preview(String(message || type || 'Upstream stream reported a failure.'))
 }
 
 function createUsageCollector(response, enabled, requestBody = {}) {
@@ -486,6 +744,7 @@ function createUsageCollector(response, enabled, requestBody = {}) {
       inputTokens,
       outputTokens,
       cachedTokens: 0,
+      cachedTokensReported: false,
       cacheWriteTokens: 0,
       totalTokens: inputTokens + outputTokens,
       estimated: true,
@@ -554,7 +813,7 @@ function extractStreamUsage(text) {
 
 function extractJsonUsage(text) {
   const payload = JSON.parse(text)
-  return normalizeUsagePayload(payload?.usage)
+  return normalizeUsagePayload(payload?.usage || payload?.response?.usage)
 }
 
 function estimateInputTokens(body = {}) {
@@ -569,11 +828,17 @@ function estimateInputTokens(body = {}) {
 
 function estimatePayloadOutputChars(payload) {
   let chars = 0
+  if (typeof payload?.delta === 'string') chars += payload.delta.length
   if (Array.isArray(payload?.choices)) {
     for (const choice of payload.choices) {
       chars += contentLength(choice?.message?.content)
       chars += contentLength(choice?.delta?.content)
       chars += contentLength(choice?.text)
+      if (Array.isArray(choice?.delta?.tool_calls)) {
+        for (const toolCall of choice.delta.tool_calls) {
+          chars += contentLength(toolCall?.function?.arguments)
+        }
+      }
     }
   }
   chars += contentLength(payload?.output_text)
@@ -646,9 +911,32 @@ function writeResponseChunk(res, chunk) {
   })
 }
 
-function makeClientAbortedError(usage = null) {
+function makeClientAbortedError(usage = null, stream = null) {
   const error = new Error('Client disconnected before the upstream response completed.')
   error.code = CLIENT_ABORTED_CODE
+  error.usage = usage
+  error.stream = stream
+  return error
+}
+
+function makeUpstreamStreamError(message, stream = null) {
+  const error = new Error(`Upstream stream failed before completion: ${message}`)
+  error.code = UPSTREAM_STREAM_FAILED_CODE
+  error.stream = stream
+  return error
+}
+
+function makeUpstreamStreamIncompleteError(stream = null) {
+  const error = new Error('Upstream stream ended before a completion event was received.')
+  error.code = UPSTREAM_STREAM_INCOMPLETE_CODE
+  error.stream = stream
+  return error
+}
+
+function makeUpstreamStreamIdleError(timeoutMs, stream = null, usage = null) {
+  const error = new Error(`Upstream response stayed idle for ${timeoutMs} ms.`)
+  error.code = UPSTREAM_STREAM_IDLE_CODE
+  error.stream = stream
   error.usage = usage
   return error
 }
@@ -678,12 +966,18 @@ function isAuthorized(headers, expectedKey) {
 
 function publicAttempt(attempt) {
   return {
+    providerId: attempt.providerId,
     providerName: attempt.providerName,
+    credentialId: attempt.credentialId || '',
     credentialLabel: attempt.credentialLabel || '',
     model: attempt.model,
     status: attempt.status ?? null,
     latencyMs: attempt.latencyMs ?? null,
     error: attempt.error ? preview(attempt.error) : null,
+    outcome: attempt.outcome || '',
+    reconnectFailureCount: attempt.reconnectFailureCount || 0,
+    reconnectFailureThreshold: attempt.reconnectFailureThreshold || 0,
+    failoverArmed: Boolean(attempt.failoverArmed),
   }
 }
 

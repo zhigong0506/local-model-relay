@@ -7,10 +7,13 @@ import { StateStore } from './state-store.mjs'
 import { handleProxyRequest } from './proxy.mjs'
 import { publicDir, rootDir } from './paths.mjs'
 import { previewRoute, realTestProvider, syncProviderCredentialUsage, testProvider } from './provider-test.mjs'
+import { fetchSpeedTestModels, runSpeedTest } from './speed-test.mjs'
 
 const configStore = new ConfigStore()
 const stateStore = new StateStore()
 const runtimeConfig = configStore.get()
+const runtimeListenHost = normalizeRuntimeHost(process.env.LOCAL_MODEL_RELAY_HOST, runtimeConfig.service.listenHost)
+const runtimeListenPort = normalizeRuntimePort(process.env.LOCAL_MODEL_RELAY_PORT, runtimeConfig.service.listenPort)
 stateStore.pruneProviders(runtimeConfig.providers.map((provider) => provider.id))
 const MAX_ADMIN_BODY_BYTES = 2 * 1024 * 1024
 
@@ -31,27 +34,28 @@ const server = createServer(async (req, res) => {
 server.on('error', (error) => {
   const code = error && typeof error === 'object' ? error.code : ''
   if (code === 'EADDRINUSE') {
-    console.error(`[relay] failed to start: ${runtimeConfig.service.listenHost}:${runtimeConfig.service.listenPort} is already in use.`)
+    relayError(`failed to start: ${runtimeConfig.service.listenHost}:${runtimeConfig.service.listenPort} is already in use.`)
   } else if (code === 'EACCES') {
-    console.error(`[relay] failed to start: no permission to listen on ${runtimeConfig.service.listenHost}:${runtimeConfig.service.listenPort}.`)
+    relayError(`failed to start: no permission to listen on ${runtimeConfig.service.listenHost}:${runtimeConfig.service.listenPort}.`)
   } else {
-    console.error(`[relay] failed to start: ${error instanceof Error ? error.message : String(error)}`)
+    relayError(`failed to start: ${error instanceof Error ? error.message : String(error)}`)
   }
   process.exit(1)
 })
 
-server.listen(runtimeConfig.service.listenPort, runtimeConfig.service.listenHost, () => {
-  const address = `http://${runtimeConfig.service.listenHost}:${runtimeConfig.service.listenPort}`
-  console.log(`[relay] admin: ${address}/admin`)
-  console.log(`[relay] local api: ${address}/v1`)
-  console.log(`[relay] outbound: ${formatOutboundLog(currentOutboundRuntime(runtimeConfig.service))}`)
-  console.log(`[relay] project: ${rootDir}`)
+server.listen(runtimeListenPort, runtimeListenHost, () => {
+  const address = `http://${runtimeListenHost}:${runtimeListenPort}`
+  relayLog(`admin: ${address}/admin`)
+  relayLog(`local api: ${address}/v1`)
+  relayLog(`outbound: ${formatOutboundLog(currentOutboundRuntime(runtimeConfig.service))}`)
+  relayLog(`project: ${rootDir}`)
 })
 
 async function routeRequest(req, res) {
   const url = new URL(req.url, `http://${req.headers.host || '127.0.0.1'}`)
 
   if (url.pathname.startsWith('/api/')) {
+    assertLocalAdminClient(req)
     assertAllowedHost(req.headers.host)
     assertTrustedBrowserSource(req)
   }
@@ -97,6 +101,16 @@ async function routeRequest(req, res) {
   if (url.pathname === '/api/state/usage' && req.method === 'DELETE') {
     stateStore.clearUsage()
     return sendJson(res, 200, runtimeState())
+  }
+
+  if (url.pathname === '/api/speed-test/models' && req.method === 'POST') {
+    const config = configStore.get()
+    return sendJson(res, 200, await fetchSpeedTestModels(await readJson(req), config.service))
+  }
+
+  if (url.pathname === '/api/speed-test/run' && req.method === 'POST') {
+    const config = configStore.get()
+    return sendJson(res, 200, await runSpeedTest(await readJson(req), config.service))
   }
 
   if (url.pathname === '/api/routing/start' && req.method === 'POST') {
@@ -158,7 +172,7 @@ async function routeRequest(req, res) {
     const provider = config.providers.find((item) => item.id === providerRealTestMatch[1])
     if (!provider) throw new HttpError(404, 'provider_not_found', 'Provider not found.')
     const result = await realTestProvider(provider, await readJson(req), config.service)
-    recordRealTestResult(provider, result)
+    if (!result.skipped) recordRealTestResult(provider, result)
     return sendJson(res, 200, result)
   }
 
@@ -204,6 +218,7 @@ async function routeRequest(req, res) {
 
   if (url.pathname === '/api/process/exit' && req.method === 'POST') {
     sendJson(res, 200, { ok: true })
+    relayLog('shutdown requested through the management API')
     setTimeout(() => process.exit(0), 150)
     return
   }
@@ -297,7 +312,10 @@ async function readJson(req) {
 }
 
 function recordRealTestResult(provider, result) {
+  if (provider.tags?.includes('tmp-real-test-model')) return
+
   const latencyMs = Number(result.latencyMs) || 0
+  const config = configStore.get()
   if (result.ok) {
     stateStore.markSuccess(provider.id, { status: result.status || 200, latencyMs })
     if (result.usage) {
@@ -314,6 +332,45 @@ function recordRealTestResult(provider, result) {
       cooldownSeconds: 0,
     })
   }
+  if (config.service.logRequests) {
+    stateStore.addRequestLog({
+      testType: 'real_test',
+      method: 'TEST',
+      path: result.wireApi === 'responses' ? '/v1/responses' : '/v1/chat/completions',
+      model: result.model,
+      routedModel: result.model,
+      providerId: provider.id,
+      providerName: provider.name,
+      credentialId: result.credentialId || provider.activeCredentialId || '',
+      credentialLabel: result.credentialLabel || '',
+      status: result.status || 0,
+      ok: Boolean(result.ok),
+      attempts: [{
+        providerId: provider.id,
+        providerName: provider.name,
+        credentialId: result.credentialId || provider.activeCredentialId || '',
+        credentialLabel: result.credentialLabel || '',
+        model: result.model,
+        status: result.status || 0,
+        latencyMs,
+        error: result.ok ? null : result.message || 'Real test failed.',
+        outcome: result.ok ? 'real_test_success' : 'real_test_failed',
+      }],
+      durationMs: latencyMs,
+      outcome: result.ok ? 'real_test_success' : 'real_test_failed',
+      stream: false,
+      usage: result.ok ? result.usage : null,
+      error: result.ok ? undefined : result.message || 'Real test failed.',
+    }, config.service.requestLogLimit)
+  }
+}
+
+function relayLog(message) {
+  console.log(`[${new Date().toISOString()}] [relay] ${message}`)
+}
+
+function relayError(message) {
+  console.error(`[${new Date().toISOString()}] [relay] ${message}`)
 }
 
 function runtimeState() {
@@ -366,11 +423,27 @@ function isAllowedLocalOrigin(value) {
     const url = new URL(value)
     return (
       (url.hostname === '127.0.0.1' || url.hostname === 'localhost' || url.hostname === '[::1]') &&
-      (!url.port || Number(url.port) === runtimeConfig.service.listenPort)
+      (!url.port || Number(url.port) === runtimeListenPort)
     )
   } catch {
     return false
   }
+}
+
+function assertLocalAdminClient(req) {
+  const address = String(req.socket?.remoteAddress || '').toLowerCase()
+  if (address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1') return
+  throw new HttpError(403, 'forbidden_client', 'Management API only accepts local loopback clients.')
+}
+
+function normalizeRuntimeHost(value, fallback) {
+  const host = String(value || '').trim()
+  return host || fallback
+}
+
+function normalizeRuntimePort(value, fallback) {
+  const port = Number(value)
+  return Number.isInteger(port) && port >= 1 && port <= 65535 ? port : fallback
 }
 
 function isInsideDirectory(parent, child) {

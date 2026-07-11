@@ -11,10 +11,10 @@ const service = loadServiceConfig()
 const plan = resolveOutboundProxyPlan(service)
 const args = [...plan.nodeArgs, resolve(rootDir, 'src', 'server.mjs')]
 
-console.log(`[relay] launcher outbound: ${describeOutboundPlan(plan)}`)
-if (plan.warning) console.warn(`[relay] launcher warning: ${plan.warning}`)
+relayLog(`launcher outbound: ${describeOutboundPlan(plan)}`)
+if (plan.warning) relayWarn(`launcher warning: ${plan.warning}`)
 if (plan.detectedProxyUrl && plan.proxySource !== 'custom') {
-  console.log(`[relay] launcher detected proxy: ${maskProxyUrl(plan.detectedProxyUrl)}`)
+  relayLog(`launcher detected proxy: ${maskProxyUrl(plan.detectedProxyUrl)}`)
 }
 
 const child = spawn(process.execPath, args, {
@@ -24,6 +24,7 @@ const child = spawn(process.execPath, args, {
 })
 
 child.on('exit', (code, signal) => {
+  relayLog(signal ? `server exited by signal ${signal}` : `server exited with code ${code ?? 0}`)
   if (signal) {
     process.kill(process.pid, signal)
     return
@@ -32,7 +33,7 @@ child.on('exit', (code, signal) => {
 })
 
 child.on('error', (error) => {
-  console.error(`[relay] launcher failed: ${error instanceof Error ? error.message : String(error)}`)
+  relayError(`launcher failed: ${error instanceof Error ? error.message : String(error)}`)
   process.exit(1)
 })
 
@@ -45,7 +46,19 @@ function loadServiceConfig() {
       ? config.service
       : {}
   } catch (error) {
-    console.warn(`[relay] launcher warning: failed to read config, using direct outbound. ${error instanceof Error ? error.message : String(error)}`)
+    relayWarn(`launcher warning: failed to read config, using direct outbound. ${error instanceof Error ? error.message : String(error)}`)
     return {}
   }
+}
+
+function relayLog(message) {
+  console.log(`[${new Date().toISOString()}] [relay] ${message}`)
+}
+
+function relayWarn(message) {
+  console.warn(`[${new Date().toISOString()}] [relay] ${message}`)
+}
+
+function relayError(message) {
+  console.error(`[${new Date().toISOString()}] [relay] ${message}`)
 }

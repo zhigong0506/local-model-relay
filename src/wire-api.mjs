@@ -109,22 +109,41 @@ export function transformResponsePayload(payload, plan) {
 export function normalizeUsagePayload(usage) {
   if (!usage || typeof usage !== 'object' || Array.isArray(usage)) return null
 
-  const inputTokens = toTokenCount(usage.prompt_tokens ?? usage.input_tokens)
-  const outputTokens = toTokenCount(usage.completion_tokens ?? usage.output_tokens)
-  const cachedTokens = toTokenCount(
+  const inputTokens = toTokenCount(usage.prompt_tokens ?? usage.input_tokens ?? usage.input)
+  const outputTokens = toTokenCount(usage.completion_tokens ?? usage.output_tokens ?? usage.output)
+  const cachedTokenValue =
+    usage.input_tokens_details?.cached_tokens ??
     usage.prompt_tokens_details?.cached_tokens ??
     usage.cache_read_input_tokens ??
-    usage.cache_read_tokens,
-  )
+    usage.cache_read_tokens ??
+    usage.cacheRead ??
+    usage.readCache ??
+    usage.cache?.readTokens ??
+    usage.cache?.read_tokens ??
+    usage.cache?.cachedTokens
+  const cachedTokensReported = cachedTokenValue !== undefined && cachedTokenValue !== null
+  const cachedTokens = toTokenCount(cachedTokenValue)
   const cacheWriteTokens = toTokenCount(
     usage.cache_creation_input_tokens ??
     usage.cache_write_input_tokens ??
-    usage.cache_write_tokens,
+    usage.cache_write_tokens ??
+    usage.cacheWrite ??
+    usage.writeCache ??
+    usage.cache?.writeTokens ??
+    usage.cache?.write_tokens ??
+    usage.cache?.creationTokens,
   )
-  const totalTokens = toTokenCount(usage.total_tokens) || inputTokens + outputTokens
+  const totalTokens = toTokenCount(usage.total_tokens ?? usage.totalTokens ?? usage.total) || inputTokens + outputTokens
 
   if (!inputTokens && !outputTokens && !cachedTokens && !cacheWriteTokens && !totalTokens) return null
-  return { inputTokens, outputTokens, cachedTokens, cacheWriteTokens, totalTokens }
+  return {
+    inputTokens,
+    outputTokens,
+    cachedTokens,
+    cachedTokensReported,
+    cacheWriteTokens,
+    totalTokens,
+  }
 }
 
 function detectWireApi(requestUrl) {
@@ -167,12 +186,25 @@ function responsesRequestToChat(body) {
     max_output_tokens: maxOutputTokens,
     text: _text,
     reasoning: _reasoning,
+    tools,
+    tool_choice: toolChoice,
+    include: _include,
+    previous_response_id: _previousResponseId,
+    background: _background,
+    conversation: _conversation,
+    truncation: _truncation,
+    prompt_cache_key: _promptCacheKey,
+    safety_identifier: _safetyIdentifier,
     ...rest
   } = body
   const out = {
     ...rest,
     messages: responsesInputToMessages(input, instructions),
   }
+  if (Array.isArray(tools)) {
+    out.tools = tools.map(responsesToolToChatTool).filter(Boolean)
+  }
+  if (toolChoice !== undefined) out.tool_choice = responsesToolChoiceToChat(toolChoice)
   if (maxOutputTokens !== undefined && out.max_tokens === undefined && out.max_completion_tokens === undefined) {
     out.max_tokens = maxOutputTokens
   }
@@ -218,18 +250,51 @@ function responsesInputToMessages(input, instructions = '') {
   }
 
   if (Array.isArray(input)) {
+    let assistantToolCalls = []
+    const flushAssistantToolCalls = () => {
+      if (!assistantToolCalls.length) return
+      messages.push({ role: 'assistant', content: null, tool_calls: assistantToolCalls })
+      assistantToolCalls = []
+    }
+
     for (const item of input) {
       if (typeof item === 'string') {
+        flushAssistantToolCalls()
         messages.push({ role: 'user', content: item })
         continue
       }
       if (!item || typeof item !== 'object') continue
+
+      if (item.type === 'function_call') {
+        assistantToolCalls.push({
+          id: item.call_id || item.id || `call_${assistantToolCalls.length}`,
+          type: 'function',
+          function: {
+            name: item.name || '',
+            arguments: typeof item.arguments === 'string'
+              ? item.arguments
+              : JSON.stringify(item.arguments || {}),
+          },
+        })
+        continue
+      }
+
+      flushAssistantToolCalls()
+      if (item.type === 'function_call_output') {
+        messages.push({
+          role: 'tool',
+          tool_call_id: item.call_id || item.id || '',
+          content: toolOutputToText(item.output),
+        })
+        continue
+      }
       if (item.type && item.type !== 'message') continue
       messages.push({
         role: normalizeMessageRole(item.role),
         content: contentToText(item.content ?? item.text),
       })
     }
+    flushAssistantToolCalls()
   }
 
   return messages.length ? messages : [{ role: 'user', content: '' }]
@@ -255,19 +320,37 @@ function responsesPayloadToChat(payload) {
 function chatPayloadToResponses(payload) {
   const choice = Array.isArray(payload?.choices) ? payload.choices[0] : null
   const text = contentToText(choice?.message?.content ?? choice?.text ?? '')
+  const messageId = `msg_${payload?.id || Date.now()}`
+  const output = []
+  if (text) {
+    output.push({
+      id: messageId,
+      type: 'message',
+      status: 'completed',
+      role: 'assistant',
+      content: [{ type: 'output_text', text, annotations: [] }],
+    })
+  }
+  for (const [index, toolCall] of (choice?.message?.tool_calls || []).entries()) {
+    const functionCall = toolCall?.function || {}
+    output.push({
+      id: toolCall?.id || `fc_${payload?.id || Date.now()}_${index}`,
+      type: 'function_call',
+      status: 'completed',
+      call_id: toolCall?.id || `call_${index}`,
+      name: functionCall.name || '',
+      arguments: typeof functionCall.arguments === 'string'
+        ? functionCall.arguments
+        : JSON.stringify(functionCall.arguments || {}),
+    })
+  }
   return {
     id: payload?.id?.startsWith('resp_') ? payload.id : `resp_${payload?.id || Date.now()}`,
     object: 'response',
     created_at: payload?.created || Math.floor(Date.now() / 1000),
     status: 'completed',
     model: payload?.model || '',
-    output: [{
-      id: `msg_${payload?.id || Date.now()}`,
-      type: 'message',
-      status: 'completed',
-      role: 'assistant',
-      content: [{ type: 'output_text', text, annotations: [] }],
-    }],
+    output,
     output_text: text,
     usage: chatUsageToResponsesUsage(payload?.usage),
   }
@@ -322,55 +405,207 @@ function responsesSseToChatSse(text) {
 }
 
 function chatSseToResponsesSse(text) {
+  const events = parseSse(text)
+  const payloads = events
+    .filter((event) => event.data && event.data !== '[DONE]')
+    .map((event) => parseJson(event.data))
+    .filter(Boolean)
+  const firstPayload = payloads.find((payload) => payload.id || payload.model) || {}
+  const responseId = firstPayload.id?.startsWith('resp_')
+    ? firstPayload.id
+    : `resp_${firstPayload.id || Date.now()}`
+  const messageId = `msg_${responseId}`
+  const createdAt = firstPayload.created || Math.floor(Date.now() / 1000)
+  const model = firstPayload.model || ''
+  const out = []
+  const output = []
+  const outputIndexes = new Map()
+  const toolCalls = new Map()
   let fullText = ''
   let usage = null
-  const responseId = `resp_${Date.now()}`
-  const out = [
-    sseEvent('response.created', {
-      type: 'response.created',
-      response: {
-        id: responseId,
-        object: 'response',
-        status: 'in_progress',
-        output: [],
-      },
-    }),
-  ]
+  let messageOutputIndex = -1
+  let messageStarted = false
+  let nextOutputIndex = 0
+  let sequenceNumber = 0
+  const emit = (type, payload) => {
+    out.push(sseEvent(type, { type, sequence_number: sequenceNumber, ...payload }))
+    sequenceNumber += 1
+  }
 
-  for (const event of parseSse(text)) {
-    if (!event.data || event.data === '[DONE]') continue
-    const payload = parseJson(event.data)
-    if (!payload) continue
+  emit('response.created', {
+    response: {
+      id: responseId,
+      object: 'response',
+      created_at: createdAt,
+      status: 'in_progress',
+      model,
+      output: [],
+    },
+  })
+  emit('response.in_progress', {
+    response: {
+      id: responseId,
+      object: 'response',
+      created_at: createdAt,
+      status: 'in_progress',
+      model,
+      output: [],
+    },
+  })
+
+  for (const payload of payloads) {
     usage = normalizeUsagePayload(payload.usage) || usage
     const choice = Array.isArray(payload.choices) ? payload.choices[0] : null
     const delta = contentToText(choice?.delta?.content ?? '')
-    if (!delta) continue
-    fullText += delta
-    out.push(sseEvent('response.output_text.delta', {
-      type: 'response.output_text.delta',
-      response_id: responseId,
-      item_id: `msg_${responseId}`,
-      output_index: 0,
-      content_index: 0,
-      delta,
-    }))
+    if (delta) {
+      if (!messageStarted) {
+        messageStarted = true
+        messageOutputIndex = nextOutputIndex
+        nextOutputIndex += 1
+        emit('response.output_item.added', {
+          response_id: responseId,
+          output_index: messageOutputIndex,
+          item: {
+            id: messageId,
+            type: 'message',
+            status: 'in_progress',
+            role: 'assistant',
+            content: [],
+          },
+        })
+        emit('response.content_part.added', {
+          response_id: responseId,
+          item_id: messageId,
+          output_index: messageOutputIndex,
+          content_index: 0,
+          part: { type: 'output_text', text: '', annotations: [] },
+        })
+      }
+      fullText += delta
+      emit('response.output_text.delta', {
+        response_id: responseId,
+        item_id: messageId,
+        output_index: messageOutputIndex,
+        content_index: 0,
+        delta,
+      })
+    }
+
+    for (const toolDelta of Array.isArray(choice?.delta?.tool_calls) ? choice.delta.tool_calls : []) {
+      const index = Number.isInteger(toolDelta?.index) ? toolDelta.index : toolCalls.size
+      let call = toolCalls.get(index)
+      if (!call) {
+        const id = toolDelta?.id || `call_${responseId}_${index}`
+        call = {
+          id,
+          callId: id,
+          name: toolDelta?.function?.name || '',
+          arguments: '',
+          outputIndex: nextOutputIndex,
+        }
+        nextOutputIndex += 1
+        toolCalls.set(index, call)
+        emit('response.output_item.added', {
+          response_id: responseId,
+          output_index: call.outputIndex,
+          item: {
+            id: call.id,
+            type: 'function_call',
+            status: 'in_progress',
+            call_id: call.callId,
+            name: call.name,
+            arguments: '',
+          },
+        })
+      }
+      if (toolDelta?.id) {
+        call.id = toolDelta.id
+        call.callId = toolDelta.id
+      }
+      if (toolDelta?.function?.name) call.name = toolDelta.function.name
+      const argumentDelta = typeof toolDelta?.function?.arguments === 'string'
+        ? toolDelta.function.arguments
+        : ''
+      if (argumentDelta) {
+        call.arguments += argumentDelta
+        emit('response.function_call_arguments.delta', {
+          response_id: responseId,
+          item_id: call.id,
+          output_index: call.outputIndex,
+          delta: argumentDelta,
+        })
+      }
+    }
   }
 
-  const completed = {
-    id: responseId,
-    object: 'response',
-    status: 'completed',
-    output: [{
-      id: `msg_${responseId}`,
+  if (messageStarted) {
+    const message = {
+      id: messageId,
       type: 'message',
       status: 'completed',
       role: 'assistant',
       content: [{ type: 'output_text', text: fullText, annotations: [] }],
-    }],
+    }
+    emit('response.output_text.done', {
+      response_id: responseId,
+      item_id: messageId,
+      output_index: messageOutputIndex,
+      content_index: 0,
+      text: fullText,
+    })
+    emit('response.content_part.done', {
+      response_id: responseId,
+      item_id: messageId,
+      output_index: messageOutputIndex,
+      content_index: 0,
+      part: message.content[0],
+    })
+    emit('response.output_item.done', {
+      response_id: responseId,
+      output_index: messageOutputIndex,
+      item: message,
+    })
+    outputIndexes.set(message.id, messageOutputIndex)
+    output.push(message)
+  }
+
+  for (const call of [...toolCalls.values()].sort((a, b) => a.outputIndex - b.outputIndex)) {
+    const item = {
+      id: call.id,
+      type: 'function_call',
+      status: 'completed',
+      call_id: call.callId,
+      name: call.name,
+      arguments: call.arguments,
+    }
+    emit('response.function_call_arguments.done', {
+      response_id: responseId,
+      item_id: call.id,
+      output_index: call.outputIndex,
+      name: call.name,
+      arguments: call.arguments,
+    })
+    emit('response.output_item.done', {
+      response_id: responseId,
+      output_index: call.outputIndex,
+      item,
+    })
+    outputIndexes.set(item.id, call.outputIndex)
+    output.push(item)
+  }
+
+  output.sort((a, b) => (outputIndexes.get(a.id) ?? 0) - (outputIndexes.get(b.id) ?? 0))
+  const completed = {
+    id: responseId,
+    object: 'response',
+    created_at: createdAt,
+    status: 'completed',
+    model,
+    output,
     output_text: fullText,
     usage: usage ? internalUsageToResponsesUsage(usage) : undefined,
   }
-  out.push(sseEvent('response.completed', { type: 'response.completed', response: completed }))
+  emit('response.completed', { response: completed })
   return { text: out.join(''), usage }
 }
 
@@ -412,6 +647,40 @@ function readResponsesText(payload) {
   return parts.join('')
 }
 
+function responsesToolToChatTool(tool) {
+  if (!tool || typeof tool !== 'object' || tool.type !== 'function' || !tool.name) return null
+  return {
+    type: 'function',
+    function: {
+      name: tool.name,
+      description: tool.description || '',
+      parameters: tool.parameters && typeof tool.parameters === 'object'
+        ? tool.parameters
+        : { type: 'object', properties: {} },
+      ...(typeof tool.strict === 'boolean' ? { strict: tool.strict } : {}),
+    },
+  }
+}
+
+function responsesToolChoiceToChat(toolChoice) {
+  if (typeof toolChoice === 'string') return toolChoice
+  if (toolChoice?.type === 'function' && toolChoice.name) {
+    return { type: 'function', function: { name: toolChoice.name } }
+  }
+  return toolChoice
+}
+
+function toolOutputToText(output) {
+  if (typeof output === 'string') return output
+  if (output == null) return ''
+  if (Array.isArray(output)) return contentToText(output)
+  try {
+    return JSON.stringify(output)
+  } catch {
+    return String(output)
+  }
+}
+
 function contentToText(content) {
   if (typeof content === 'string') return content
   if (!Array.isArray(content)) return content == null ? '' : String(content)
@@ -444,7 +713,9 @@ function internalUsageToChatUsage(usage) {
     prompt_tokens: usage.inputTokens,
     completion_tokens: usage.outputTokens,
     total_tokens: usage.totalTokens,
-    prompt_tokens_details: usage.cachedTokens ? { cached_tokens: usage.cachedTokens } : undefined,
+    prompt_tokens_details: usage.cachedTokensReported || usage.cachedTokens
+      ? { cached_tokens: usage.cachedTokens }
+      : undefined,
   }
 }
 
@@ -453,7 +724,12 @@ function internalUsageToResponsesUsage(usage) {
     input_tokens: usage.inputTokens,
     output_tokens: usage.outputTokens,
     total_tokens: usage.totalTokens,
-    cache_read_input_tokens: usage.cachedTokens || undefined,
+    input_tokens_details: usage.cachedTokensReported || usage.cachedTokens
+      ? { cached_tokens: usage.cachedTokens }
+      : undefined,
+    cache_read_input_tokens: usage.cachedTokensReported || usage.cachedTokens
+      ? usage.cachedTokens
+      : undefined,
     cache_creation_input_tokens: usage.cacheWriteTokens || undefined,
   }
 }
@@ -467,6 +743,14 @@ function parseJson(text) {
 }
 
 function toTokenCount(value) {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    return toTokenCount(
+      value.totalTokens ??
+      value.total_tokens ??
+      value.tokens ??
+      value.value,
+    )
+  }
   const number = Number(value)
   return Number.isFinite(number) && number > 0 ? Math.round(number) : 0
 }

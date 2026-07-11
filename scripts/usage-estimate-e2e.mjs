@@ -11,7 +11,13 @@ try {
   const localKey = config.service.localApiKey
   const noUsage = await runNoUsageSuccess(localKey)
   const interrupted = await runInterruptedStream(localKey)
-  const report = { ok: noUsage.ok && interrupted.ok, noUsage, interrupted }
+  const toolHandoff = await runToolCallHandoff(localKey)
+  const report = {
+    ok: noUsage.ok && interrupted.ok && toolHandoff.ok,
+    noUsage,
+    interrupted,
+    toolHandoff,
+  }
   console.log(JSON.stringify(report, null, 2))
   if (!report.ok) process.exitCode = 1
 } finally {
@@ -91,7 +97,78 @@ async function runInterruptedStream(localKey) {
   }
 }
 
-async function createProviderAndRoute(model, server) {
+async function runToolCallHandoff(localKey) {
+  const model = `usage-tool-handoff-${stamp}`
+  const server = await startMockServer((req, res) => {
+    res.statusCode = 200
+    res.setHeader('content-type', 'text/event-stream; charset=utf-8')
+    res.write('data: {"type":"response.created","response":{"id":"resp_test","status":"in_progress"}}\n\n')
+    res.write('data: {"type":"response.output_item.added","item":{"type":"function_call","name":"diagnostic_ping"}}\n\n')
+    res.write('data: {"type":"response.function_call_arguments.delta","delta":"{\\"value\\":\\"ok\\"}"}\n\n')
+    res.write('data: {"type":"response.function_call_arguments.done","arguments":"{\\"value\\":\\"ok\\"}"}\n\n')
+    const timer = setInterval(() => {
+      if (!res.destroyed) res.write(': keepalive\n\n')
+    }, 200)
+    res.on('close', () => clearInterval(timer))
+  })
+  servers.push(server)
+  await createProviderAndRoute(model, server, 'responses')
+
+  const controller = new AbortController()
+  const response = await fetch(`${relay}/v1/responses`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: `Bearer ${localKey}`,
+    },
+    body: JSON.stringify({
+      model,
+      stream: true,
+      input: 'call diagnostic tool',
+      tools: [{
+        type: 'function',
+        name: 'diagnostic_ping',
+        description: 'diagnostic tool',
+        parameters: {
+          type: 'object',
+          properties: { value: { type: 'string' } },
+          required: ['value'],
+          additionalProperties: false,
+        },
+      }],
+    }),
+    signal: controller.signal,
+  })
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let text = ''
+  while (!text.includes('response.function_call_arguments.done')) {
+    const { value, done } = await reader.read()
+    if (done) break
+    text += decoder.decode(value, { stream: true })
+  }
+  controller.abort()
+  try {
+    await reader.cancel()
+  } catch {}
+
+  const log = await waitForLog(model)
+  return {
+    ok: log?.ok === true &&
+      log?.outcome === 'tool_call_handoff' &&
+      !log?.error &&
+      Number(log?.usage?.outputTokens || 0) > 0,
+    responseStatus: response.status,
+    loggedStatus: log?.status,
+    outcome: log?.outcome || '',
+    error: log?.error || '',
+    stream: log?.stream || null,
+    usage: log?.usage || null,
+  }
+}
+
+async function createProviderAndRoute(model, server, wireApi = 'chat') {
   const provider = await api('/api/providers', {
     method: 'POST',
     body: {
@@ -99,7 +176,7 @@ async function createProviderAndRoute(model, server) {
       baseUrl: serverBaseUrl(server),
       credentials: [{ label: 'mock', apiKey: 'mock-key', enabled: true }],
       authMode: 'authorization',
-      wireApi: 'chat',
+      wireApi,
       priority: 9300 + createdProviders.length * 10,
       timeoutMs: 5000,
       cooldownSeconds: 2,

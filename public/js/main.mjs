@@ -8,8 +8,14 @@ const state = {
   providerDragSaved: false,
   draggingTargetRow: null,
   dragArmed: false,
-  usageWindow: 'today',
+  usageRange: '24h',
+  usageCustomStart: '',
+  usageCustomEnd: '',
   activeTab: 'providers',
+  logsPage: 1,
+  logsPageSize: 20,
+  recordsPage: 1,
+  recordsPageSize: 20,
   dashboardRange: '7d',
   dashboardGranularity: 'day',
   recordsFilter: {
@@ -23,6 +29,8 @@ const state = {
   charts: {
     trend: null,
     modelShare: null,
+    usageModelShare: null,
+    usageProviderShare: null,
   },
 }
 
@@ -45,7 +53,10 @@ function bindTabs() {
       $(`#${button.dataset.tab}Panel`).classList.add('active')
       state.activeTab = button.dataset.tab
       if (state.activeTab === 'dashboard') nextFrame().then(renderDashboard)
+      if (state.activeTab === 'speed') renderSpeedTestIdle()
       if (state.activeTab === 'records') renderRecords()
+      if (state.activeTab === 'logs') renderLogs()
+      if (state.activeTab === 'usage') nextFrame().then(renderUsage)
     })
   })
 }
@@ -59,12 +70,17 @@ function bindActions() {
   $('#routingStartMode').addEventListener('change', saveRoutingMode)
   $('#clearStartProviderBtn').addEventListener('click', clearStartProvider)
   formField($('#providerForm'), 'providerOutboundProxyMode').addEventListener('change', renderProviderProxyFields)
+  formField($('#providerForm'), 'timeoutSeconds').addEventListener('input', renderProviderTimeoutHint)
   $('#newRouteBtn').addEventListener('click', () => openRouteDialog())
   $('#providerForm').addEventListener('submit', saveProvider)
   $('#realTestForm').addEventListener('submit', runRealTest)
   $('#routeForm').addEventListener('submit', saveRoute)
   bindTargetDragSort()
   $('#settingsForm').addEventListener('submit', saveSettings)
+  $('#speedTestForm').addEventListener('submit', runSpeedTest)
+  $('#fetchSpeedModelsBtn').addEventListener('click', fetchSpeedModels)
+  $('#clearSpeedTestBtn').addEventListener('click', clearSpeedTestResult)
+  formField($('#speedTestForm'), 'proxyMode').addEventListener('change', renderSpeedProxyField)
   $$('[name="outboundProxyMode"]', $('#settingsForm')).forEach((input) => {
     input.addEventListener('change', renderOutboundProxyFields)
   })
@@ -74,7 +90,13 @@ function bindActions() {
   $('#clearLogsBtn').addEventListener('click', clearLogs)
   $('#clearRecordsBtn').addEventListener('click', clearLogs)
   $('#clearUsageBtn').addEventListener('click', clearUsage)
-  $('#usageWindowTabs').addEventListener('click', handleUsageWindowSwitch)
+  $('#usageRangeButton').addEventListener('click', toggleUsageRangeMenu)
+  $('#usageRangeMenu').addEventListener('click', handleUsageRangeShortcut)
+  $('#usageRangeStart').addEventListener('change', handleUsageCustomDateChange)
+  $('#usageRangeEnd').addEventListener('change', handleUsageCustomDateChange)
+  $('#usageRangeApply').addEventListener('click', applyUsageCustomRange)
+  document.addEventListener('click', closeUsageRangeMenuOnOutsideClick)
+  document.addEventListener('keydown', closeUsageRangeMenuOnEscape)
   $('#dashboardRange').addEventListener('change', handleDashboardControlChange)
   $('#dashboardGranularity').addEventListener('change', handleDashboardControlChange)
   $('#goRecordsBtn').addEventListener('click', () => switchTab('records'))
@@ -84,6 +106,12 @@ function bindActions() {
   $('#recordProvider').addEventListener('change', handleRecordFilterChange)
   $('#recordRange').addEventListener('change', handleRecordFilterChange)
   $('#recordSort').addEventListener('change', handleRecordFilterChange)
+  $('#recordPageSize').addEventListener('change', handleRecordPageSizeChange)
+  $('#recordPrevPage').addEventListener('click', () => changeRecordsPage(-1))
+  $('#recordNextPage').addEventListener('click', () => changeRecordsPage(1))
+  $('#logPageSize').addEventListener('change', handleLogPageSizeChange)
+  $('#logPrevPage').addEventListener('click', () => changeLogsPage(-1))
+  $('#logNextPage').addEventListener('click', () => changeLogsPage(1))
   $('#exportRecordsCsvBtn').addEventListener('click', exportRecordsCsv)
   $('#exportConfigBtn').addEventListener('click', exportConfig)
   $('#importConfigBtn').addEventListener('click', () => $('#importConfigFile').click())
@@ -117,6 +145,7 @@ async function refreshState() {
 function render() {
   renderStatus()
   renderSettings()
+  renderSpeedProxyField()
   renderRoutingBar()
   renderProviders()
   renderRoutes()
@@ -124,6 +153,134 @@ function render() {
   renderDashboard()
   renderRecords()
   renderLogs()
+}
+
+function renderSpeedProxyField() {
+  const form = $('#speedTestForm')
+  if (!form) return
+  $('#speedProxyUrlField').hidden = formField(form, 'proxyMode').value !== 'custom'
+}
+
+async function fetchSpeedModels() {
+  const form = $('#speedTestForm')
+  const button = $('#fetchSpeedModelsBtn')
+  button.disabled = true
+  button.textContent = '获取中'
+  $('#speedTestStatus').textContent = '正在获取模型列表'
+  try {
+    const result = await api('/api/speed-test/models', {
+      method: 'POST',
+      body: speedTestPayload(form, { includeModel: false }),
+    })
+    const options = $('#speedModelOptions')
+    options.innerHTML = (result.models || [])
+      .map((model) => `<option value="${escapeHtml(model)}"></option>`)
+      .join('')
+    if (result.models?.length && !formField(form, 'model').value) {
+      formField(form, 'model').value = preferredSpeedModel(result.models)
+    }
+    $('#speedTestStatus').textContent = result.ok ? result.message : `获取失败：HTTP ${result.status || 0}`
+    toast(result.ok ? `发现 ${result.models.length} 个模型` : `获取模型失败：${result.message}`)
+  } catch (error) {
+    $('#speedTestStatus').textContent = '获取模型失败'
+    toast(error instanceof Error ? error.message : String(error))
+  } finally {
+    button.disabled = false
+    button.textContent = '获取模型'
+  }
+}
+
+async function runSpeedTest(event) {
+  event.preventDefault()
+  const form = event.currentTarget
+  const button = $('#runSpeedTestBtn')
+  button.disabled = true
+  button.textContent = '测速中'
+  renderSpeedTestPending()
+  await nextFrame()
+
+  try {
+    const result = await api('/api/speed-test/run', {
+      method: 'POST',
+      body: speedTestPayload(form),
+    })
+    renderSpeedTestResult(result)
+    toast(result.partialOk || result.ok ? result.message : `测速失败：${result.message}`)
+  } catch (error) {
+    renderSpeedTestResult({
+      ok: false,
+      message: error instanceof Error ? error.message : String(error),
+      rounds: [],
+    })
+  } finally {
+    button.disabled = false
+    button.textContent = '开始测速'
+  }
+}
+
+function speedTestPayload(form, options = {}) {
+  return {
+    baseUrl: formField(form, 'baseUrl').value,
+    apiKey: formField(form, 'apiKey').value,
+    model: options.includeModel === false ? '' : formField(form, 'model').value,
+    wireApi: formField(form, 'wireApi').value,
+    proxyMode: formField(form, 'proxyMode').value,
+    proxyUrl: formField(form, 'proxyUrl').value,
+    rounds: Number(formField(form, 'rounds').value),
+    maxTokens: Number(formField(form, 'maxTokens').value),
+    timeoutMs: Number(formField(form, 'timeoutMs').value),
+    prompt: formField(form, 'prompt').value,
+  }
+}
+
+function renderSpeedTestIdle() {
+  if (!$('#speedResultRows .speed-result-row')) $('#speedTestStatus').textContent = '等待测试'
+}
+
+function renderSpeedTestPending() {
+  $('#speedTestStatus').textContent = '正在测速'
+  $('#speedSummary').innerHTML = speedSummaryHtml()
+  $('#speedResultRows').innerHTML = '<div class="empty">正在发起流式请求并测量首字延迟...</div>'
+}
+
+function clearSpeedTestResult() {
+  $('#speedTestStatus').textContent = '等待测试'
+  $('#speedSummary').innerHTML = speedSummaryHtml()
+  $('#speedResultRows').innerHTML = '<div class="empty">还没有测速结果。</div>'
+}
+
+function renderSpeedTestResult(result) {
+  const summary = result.summary || null
+  $('#speedTestStatus').textContent = result.message || (result.ok ? '测速完成' : '测速失败')
+  $('#speedSummary').innerHTML = speedSummaryHtml(summary, result.rounds?.length || 0)
+  const rows = $('#speedResultRows')
+  rows.innerHTML = result.rounds?.length ? '' : `<div class="empty">${escapeHtml(result.message || '没有结果。')}</div>`
+  for (const round of result.rounds || []) {
+    const item = document.createElement('div')
+    item.className = `speed-result-row ${round.ok ? 'ok' : 'warn'}`
+    item.innerHTML = `
+      <div><strong>第 ${formatNumber(round.round)} 轮</strong><small>${round.ok ? 'HTTP ' + round.status : escapeHtml(round.message || '失败')}</small></div>
+      <div><strong>${round.firstTokenMs == null ? '-' : `${round.firstTokenMs} ms`}</strong><small>首字</small></div>
+      <div><strong>${round.totalMs ?? round.latencyMs ?? '-'} ms</strong><small>总耗时</small></div>
+      <div><strong>${round.tokensPerSecond ? `${round.tokensPerSecond} tok/s` : '-'}</strong><small>速度</small></div>
+      <div><strong>${formatTokenCompact(round.outputTokens || 0)}</strong><small>输出 Token</small></div>
+      <div class="wide"><span class="label">回复预览</span><pre>${escapeHtml(round.content || round.message || '-')}</pre></div>
+    `
+    rows.appendChild(item)
+  }
+}
+
+function speedSummaryHtml(summary = null, totalRounds = 0) {
+  return `
+    <div><span class="label">首字延迟</span><strong>${summary?.avgFirstTokenMs == null ? '-' : `${summary.avgFirstTokenMs} ms`}</strong></div>
+    <div><span class="label">总耗时</span><strong>${summary?.avgTotalMs == null ? '-' : `${summary.avgTotalMs} ms`}</strong></div>
+    <div><span class="label">输出速度</span><strong>${summary?.avgTokensPerSecond == null ? '-' : `${summary.avgTokensPerSecond} tok/s`}</strong></div>
+    <div><span class="label">成功轮次</span><strong>${summary ? `${summary.successCount}/${totalRounds}` : '-'}</strong></div>
+  `
+}
+
+function preferredSpeedModel(models = []) {
+  return models.find((model) => /mini|flash|lite|small/i.test(model)) || models[0] || ''
 }
 
 function renderStatus() {
@@ -147,8 +304,12 @@ function renderSettings() {
   formField(form, 'listenPort').value = service.listenPort
   formField(form, 'localApiKey').value = service.localApiKey
   formField(form, 'requestTimeoutMs').value = service.requestTimeoutMs
+  formField(form, 'providerTestTimeoutSeconds').value = Math.round((service.providerTestTimeoutMs || 30000) / 1000)
+  formField(form, 'providerRealTestTimeoutSeconds').value = Math.round((service.providerRealTestTimeoutMs || 90000) / 1000)
   formField(form, 'maxAttempts').value = service.maxAttempts
   formField(form, 'defaultCooldownSeconds').value = service.defaultCooldownSeconds
+  formField(form, 'reconnectFailureThreshold').value = service.reconnectFailureThreshold || 4
+  formField(form, 'reconnectCooldownSeconds').value = service.reconnectCooldownSeconds || 600
   formField(form, 'retryStatusCodes').value = service.retryStatusCodes.join(', ')
   formField(form, 'logRequests').checked = service.logRequests
   formField(form, 'collectUsage').checked = service.collectUsage
@@ -215,7 +376,7 @@ function renderProviders() {
     tr.innerHTML = `
       <td><div class="status-cell"><span class="drag-handle" title="拖拽调整优先级" aria-label="拖拽调整优先级">↕</span>${providerBadge(provider, entry)}${isStartProvider ? '<span class="pill info">起点</span>' : ''}</div></td>
       <td><strong>${escapeHtml(provider.name)}</strong><br><small>${escapeHtml(provider.tags.join(', ') || provider.activeCredentialLabel || '未设置分组')}</small></td>
-      <td>${escapeHtml(provider.baseUrl)}</td>
+      <td>${providerWebsiteLink(provider.baseUrl)}</td>
       <td>${credentialSelect(provider)}</td>
       <td>${escapeHtml(provider.models.slice(0, 4).join(', ') || '通配')}<br><small>${wireApiLabel(provider.wireApi)} · ${providerProxyLabel(provider)}</small></td>
       <td>${provider.priority}</td>
@@ -278,11 +439,24 @@ function renderRoutes() {
 }
 
 function renderLogs() {
+  if (state.activeTab !== 'logs') return
   const logs = state.runtime.requestLog || []
   const list = $('#logList')
+  const page = getPageSlice(logs.length, state.logsPage, state.logsPageSize)
+  state.logsPage = page.page
+  renderPager({
+    total: logs.length,
+    page,
+    infoNode: $('#logPagerInfo'),
+    pageTextNode: $('#logPageText'),
+    prevNode: $('#logPrevPage'),
+    nextNode: $('#logNextPage'),
+    sizeNode: $('#logPageSize'),
+    emptyText: '暂无请求记录',
+  })
   list.innerHTML = logs.length ? '' : `<div class="empty">暂无请求记录。</div>`
 
-  for (const log of logs.slice(0, 80)) {
+  for (const log of logs.slice(page.start, page.end)) {
     const item = document.createElement('div')
     item.className = 'log-item'
     item.innerHTML = `
@@ -299,12 +473,23 @@ function renderLogs() {
 function renderUsage() {
   const usage = state.runtime?.usage || {}
   const totals = usage.totals || {}
+  const rangedUsage = aggregateUsageRange()
+  const rangeLabel = usageRangeBounds().label
   $('#usageTotalTokens').textContent = formatTokenCompact(totals.totalTokens)
   $('#usageInOut').textContent = `${formatTokenCompact(totals.inputTokens)} / ${formatTokenCompact(totals.outputTokens)}`
-  $('#usageCached').textContent = formatTokenCompact(totals.cachedTokens)
+  $('#usageCached').textContent = `${formatTokenCompact(totals.cachedTokens)} · ${cacheHitRateText(totals)}`
+  $('#usageCacheCoverage').textContent = cacheCoverageText(totals)
   $('#usageRequests').textContent = formatNumber(totals.requests)
+  $('#usageRangeLabel').textContent = rangeLabel
+  $('#usageModelShareRange').textContent = `${rangeLabel} · Top 8`
+  $('#usageProviderShareRange').textContent = `${rangeLabel} · Top 8`
+  $('#usageWindowRange').textContent = rangeLabel
 
-  renderUsageWindowRows()
+  renderUsageWindowRows(rangedUsage.byProvider)
+  if (state.activeTab === 'usage') {
+    renderUsageShareChart('usageModelShare', '#usageModelShareChart', rangedUsage.byModel, null)
+    renderUsageShareChart('usageProviderShare', '#usageProviderShareChart', rangedUsage.byProvider, providerName)
+  }
   renderUsageRows('#usageProviderRows', usage.byProvider, providerName)
   renderUsageRows('#usageModelRows', usage.byModel)
   renderCredentialUsageRows()
@@ -425,22 +610,12 @@ function renderTrendChart(series) {
 function renderModelShareChart(byModel = {}) {
   if (!window.Chart) return
   const node = $('#modelShareChart')
-  const entries = Object.entries(byModel)
-    .sort((a, b) => Number(b[1]?.totalTokens || 0) - Number(a[1]?.totalTokens || 0))
-    .slice(0, 8)
-  const labels = entries.map(([model]) => model)
-  const values = entries.map(([, bucket]) => Number(bucket.totalTokens || 0))
-  const data = {
-    labels: labels.length ? labels : ['暂无数据'],
-    datasets: [{
-      data: values.length ? values : [1],
-      backgroundColor: ['#6f66d8', '#0d7b73', '#d08b2f', '#3281c3', '#9c4f87', '#4c8f54', '#c85f5f', '#6d7480'],
-      borderWidth: 0,
-    }],
-  }
+  const data = buildShareChartData(byModel)
 
   if (state.charts.modelShare) {
     state.charts.modelShare.data = data
+    state.charts.modelShare.options.plugins.tooltip = shareTooltipOptions(data)
+    state.charts.modelShare.options.plugins.legend.labels.generateLabels = shareLegendLabels(data)
     state.charts.modelShare.update()
     return
   }
@@ -448,12 +623,103 @@ function renderModelShareChart(byModel = {}) {
   state.charts.modelShare = new Chart(node, {
     type: 'doughnut',
     data,
-    options: {
-      responsive: true,
-      cutout: '64%',
-      plugins: { legend: { position: 'bottom' } },
-    },
+    options: shareChartOptions(data),
   })
+}
+
+function renderUsageShareChart(chartKey, selector, buckets = {}, labelMapper = null) {
+  if (!window.Chart) return
+  const node = $(selector)
+  if (!node) return
+  const data = buildShareChartData(buckets, labelMapper)
+
+  if (state.charts[chartKey]) {
+    state.charts[chartKey].data = data
+    state.charts[chartKey].options.plugins.tooltip = shareTooltipOptions(data)
+    state.charts[chartKey].options.plugins.legend.labels.generateLabels = shareLegendLabels(data)
+    state.charts[chartKey].update()
+    return
+  }
+
+  state.charts[chartKey] = new Chart(node, {
+    type: 'doughnut',
+    data,
+    options: shareChartOptions(data),
+  })
+}
+
+function buildShareChartData(buckets = {}, labelMapper = null) {
+  const entries = Object.entries(buckets)
+    .map(([key, bucket]) => ({
+      key,
+      label: labelMapper ? labelMapper(key) : key,
+      value: Number(bucket?.totalTokens || 0),
+    }))
+    .filter((entry) => entry.value > 0)
+    .sort((a, b) => b.value - a.value)
+
+  const top = entries.slice(0, 8)
+  const rest = entries.slice(8).reduce((sum, entry) => sum + entry.value, 0)
+  if (rest > 0) top.push({ key: '__other__', label: '其他', value: rest })
+
+  const hasData = top.length > 0
+  return {
+    labels: hasData ? top.map((entry) => entry.label) : ['暂无数据'],
+    datasets: [{
+      data: hasData ? top.map((entry) => entry.value) : [1],
+      backgroundColor: ['#109887', '#5575de', '#c78116', '#8b68c7', '#218b5c', '#438eaa', '#cf4f5a', '#74838d', '#a8b2b8'],
+      borderWidth: 0,
+    }],
+    _hasData: hasData,
+  }
+}
+
+function shareChartOptions(data) {
+  return {
+    responsive: true,
+    maintainAspectRatio: true,
+    cutout: '64%',
+    plugins: {
+      legend: {
+        position: 'bottom',
+        labels: {
+          boxWidth: 10,
+          boxHeight: 10,
+          usePointStyle: true,
+          generateLabels: shareLegendLabels(data),
+        },
+      },
+      tooltip: shareTooltipOptions(data),
+    },
+  }
+}
+
+function shareLegendLabels(data) {
+  return (chart) => {
+    const values = chart.data.datasets[0]?.data || []
+    const total = sumValues(values)
+    const base = Chart.overrides.doughnut.plugins.legend.labels.generateLabels(chart)
+    return base.map((item) => {
+      const value = Number(values[item.index] || 0)
+      return {
+        ...item,
+        text: data._hasData ? `${item.text} · ${percentText(value, total)}` : item.text,
+      }
+    })
+  }
+}
+
+function shareTooltipOptions(data) {
+  return {
+    callbacks: {
+      label(context) {
+        if (!data._hasData) return '暂无数据'
+        const values = context.dataset.data || []
+        const value = Number(context.parsed || 0)
+        return `${context.label}: ${formatTokenCompact(value)} Token · ${percentText(value, sumValues(values))}`
+      },
+    },
+  }
 }
 
 function renderDashboardRecent() {
@@ -478,10 +744,22 @@ function renderRecords() {
   syncRecordFilterControls()
   const records = getFilteredRecords()
   const rows = $('#recordRows')
-  $('#recordCount').textContent = `显示 ${formatNumber(records.length)} 条 / 共 ${formatNumber((state.runtime?.requestLog || []).length)} 条`
+  const page = getPageSlice(records.length, state.recordsPage, state.recordsPageSize)
+  state.recordsPage = page.page
+  renderPager({
+    total: records.length,
+    allTotal: (state.runtime?.requestLog || []).length,
+    page,
+    infoNode: $('#recordCount'),
+    pageTextNode: $('#recordPageText'),
+    prevNode: $('#recordPrevPage'),
+    nextNode: $('#recordNextPage'),
+    sizeNode: $('#recordPageSize'),
+    emptyText: '没有匹配记录',
+  })
   rows.innerHTML = records.length ? '' : '<tr><td colspan="7" class="empty">没有匹配的请求记录。</td></tr>'
 
-  for (const log of records.slice(0, 300)) {
+  for (const log of records.slice(page.start, page.end)) {
     const usage = log.usage || {}
     const attemptLine = (log.attempts || [])
       .map((attempt) => `${attempt.providerName || '-'}${attempt.status ? `(${attempt.status})` : ''}`)
@@ -493,7 +771,7 @@ function renderRecords() {
       <td><strong>${escapeHtml(log.model || '-')}</strong><br><small>${escapeHtml(log.routedModel || '-')}</small></td>
       <td><strong>${escapeHtml(log.providerName || '-')}</strong><br><small>${escapeHtml(credentialLabel)}</small></td>
       <td>${logStatusPill(log)}<br><small>${escapeHtml(logStatusText(log))}</small></td>
-      <td><strong>${formatTokenCompact(usage.totalTokens)}</strong><br><small>入 ${formatTokenCompact(usage.inputTokens)} / 出 ${formatTokenCompact(usage.outputTokens)} / 缓存 ${formatTokenCompact(usage.cachedTokens)}${usage.estimated ? ' · 估算' : ''}</small></td>
+      <td><strong>${formatTokenCompact(usage.totalTokens)}</strong><br><small>入 ${formatTokenCompact(usage.inputTokens)} / 出 ${formatTokenCompact(usage.outputTokens)} / 缓存 ${cacheUsageText(usage)}${usage.estimated ? ' · 估算' : ''}</small></td>
       <td><strong>${log.durationMs ?? '-'} ms</strong></td>
       <td><small>${escapeHtml(attemptLine || log.error || '-')}</small></td>
     `
@@ -509,61 +787,214 @@ function handleRecordFilterChange(event) {
   if (id === 'recordProvider') state.recordsFilter.provider = value
   if (id === 'recordRange') state.recordsFilter.range = value
   if (id === 'recordSort') state.recordsFilter.sort = value
+  state.recordsPage = 1
   renderRecords()
 }
 
-function handleUsageWindowSwitch(event) {
-  const tab = event.target.closest('.window-tab')
-  if (!tab) return
-  state.usageWindow = tab.dataset.window
-  $$('#usageWindowTabs .window-tab').forEach((item) => item.classList.toggle('active', item === tab))
-  renderUsageWindowRows()
+function handleRecordPageSizeChange(event) {
+  state.recordsPageSize = normalizePageSize(event.currentTarget.value)
+  state.recordsPage = 1
+  renderRecords()
 }
 
-// 按 epoch-hour 桶聚合每条线路在选定时间窗内的消耗。
-function aggregateWindow(hourly = {}, windowKey) {
-  const now = Date.now()
+function changeRecordsPage(delta) {
+  state.recordsPage += delta
+  renderRecords()
+}
+
+function handleLogPageSizeChange(event) {
+  state.logsPageSize = normalizePageSize(event.currentTarget.value)
+  state.logsPage = 1
+  renderLogs()
+}
+
+function changeLogsPage(delta) {
+  state.logsPage += delta
+  renderLogs()
+}
+
+function toggleUsageRangeMenu(event) {
+  event.stopPropagation()
+  const menu = $('#usageRangeMenu')
+  const willOpen = menu.hidden
+  menu.hidden = !willOpen
+  $('#usageRangeButton').setAttribute('aria-expanded', String(willOpen))
+  $('#usageRangePicker').classList.toggle('open', willOpen)
+  if (willOpen) syncUsageRangeControls()
+}
+
+function closeUsageRangeMenu() {
+  $('#usageRangeMenu').hidden = true
+  $('#usageRangeButton').setAttribute('aria-expanded', 'false')
+  $('#usageRangePicker').classList.remove('open')
+}
+
+function closeUsageRangeMenuOnOutsideClick(event) {
+  if (!$('#usageRangePicker').contains(event.target)) closeUsageRangeMenu()
+}
+
+function closeUsageRangeMenuOnEscape(event) {
+  if (event.key === 'Escape') closeUsageRangeMenu()
+}
+
+function handleUsageRangeShortcut(event) {
+  const button = event.target.closest('[data-usage-range]')
+  if (!button) return
+  const range = button.dataset.usageRange
+  if (range === 'custom') {
+    const currentBounds = usageRangeBounds()
+    state.usageCustomStart = finiteDateKey(currentBounds.start) || localDateKey(new Date())
+    state.usageCustomEnd = finiteDateKey(currentBounds.end - 1) || localDateKey(new Date())
+    state.usageRange = 'custom'
+    syncUsageRangeControls()
+    $('#usageRangeStart').focus()
+    return
+  }
+  state.usageRange = range
+  syncUsageRangeControls()
+  closeUsageRangeMenu()
+  renderUsage()
+}
+
+function handleUsageCustomDateChange() {
+  state.usageRange = 'custom'
+  syncUsageRangeShortcutState()
+}
+
+function applyUsageCustomRange() {
+  let start = $('#usageRangeStart').value
+  let end = $('#usageRangeEnd').value
+  if (!start || !end) {
+    toast('请选择开始日期和结束日期')
+    return
+  }
+  if (start > end) [start, end] = [end, start]
+  state.usageRange = 'custom'
+  state.usageCustomStart = start
+  state.usageCustomEnd = end
+  $('#usageRangeStart').value = start
+  $('#usageRangeEnd').value = end
+  closeUsageRangeMenu()
+  renderUsage()
+}
+
+function syncUsageRangeControls() {
+  const bounds = usageRangeBounds()
+  const fallbackEnd = localDateKey(new Date())
+  const fallbackStart = localDateKey(new Date(Date.now() - 6 * 86400000))
+  $('#usageRangeStart').value = state.usageCustomStart || finiteDateKey(bounds.start) || fallbackStart
+  $('#usageRangeEnd').value = state.usageCustomEnd || finiteDateKey(bounds.end - 1) || fallbackEnd
+  syncUsageRangeShortcutState()
+}
+
+function syncUsageRangeShortcutState() {
+  $$('[data-usage-range]', $('#usageRangeMenu')).forEach((button) => {
+    button.classList.toggle('active', button.dataset.usageRange === state.usageRange)
+  })
+}
+
+function usageRangeBounds(range = state.usageRange) {
+  const now = new Date()
+  const nowMs = now.getTime()
+  const dayMs = 86400000
+  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime()
+  const tomorrowStart = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1).getTime()
+
+  if (range === 'today') return { start: todayStart, end: tomorrowStart, label: '今天' }
+  if (range === 'yesterday') return { start: todayStart - dayMs, end: todayStart, label: '昨天' }
+  if (range === '24h') return { start: nowMs - dayMs, end: nowMs + 1, label: '近 24 小时' }
+  if (range === '7d') return { start: nowMs - 7 * dayMs, end: nowMs + 1, label: '近 7 天' }
+  if (range === '14d') return { start: nowMs - 14 * dayMs, end: nowMs + 1, label: '近 14 天' }
+  if (range === '30d') return { start: nowMs - 30 * dayMs, end: nowMs + 1, label: '近 30 天' }
+  if (range === 'thisMonth') {
+    return {
+      start: new Date(now.getFullYear(), now.getMonth(), 1).getTime(),
+      end: new Date(now.getFullYear(), now.getMonth() + 1, 1).getTime(),
+      label: '本月',
+    }
+  }
+  if (range === 'lastMonth') {
+    return {
+      start: new Date(now.getFullYear(), now.getMonth() - 1, 1).getTime(),
+      end: new Date(now.getFullYear(), now.getMonth(), 1).getTime(),
+      label: '上月',
+    }
+  }
+  if (range === 'all') return { start: Number.NEGATIVE_INFINITY, end: Number.POSITIVE_INFINITY, label: '全部记录' }
+
+  const startKey = state.usageCustomStart || localDateKey(now)
+  const endKey = state.usageCustomEnd || startKey
+  let start = localDateStart(startKey)
+  let end = localDateStart(endKey) + dayMs
+  if (start > end) [start, end] = [end - dayMs, start + dayMs]
+  return { start, end, label: `${formatDateLabel(start)} 至 ${formatDateLabel(end - 1)}` }
+}
+
+function aggregateUsageRange() {
+  const { start, end } = usageRangeBounds()
+  const usage = state.runtime?.usage || {}
+  const useHourly = ['24h', '7d', '14d', '30d'].includes(state.usageRange)
+  const byModel = aggregateDimensionRange(
+    useHourly ? usage.modelHourly : usage.dailyByModel,
+    start,
+    end,
+    useHourly,
+  )
+  const rawByProvider = aggregateDimensionRange(
+    useHourly ? usage.providerHourly : usage.dailyByProvider,
+    start,
+    end,
+    useHourly,
+  )
+  const byProvider = {}
+  for (const [key, bucket] of Object.entries(rawByProvider)) {
+    const canonicalKey = canonicalProviderId(key)
+    byProvider[canonicalKey] = addIntoBucket(byProvider[canonicalKey] || emptyBucket(), bucket)
+    byProvider[canonicalKey].lastAt = Math.max(
+      Number(byProvider[canonicalKey].lastAt || 0),
+      Number(bucket.lastAt || 0),
+    )
+  }
+  const totals = Object.values(byModel).reduce((sum, bucket) => addIntoBucket(sum, bucket), emptyBucket())
+  const result = { totals, byModel, byProvider }
+  return result
+}
+
+function aggregateDimensionRange(dimensions = {}, start, end, hourly) {
+  const result = {}
   const hourMs = 3600000
-  let threshold
-  if (windowKey === '24h') threshold = now - 24 * hourMs
-  else if (windowKey === '7d') threshold = now - 7 * 24 * hourMs
-  else if (windowKey === '30d') threshold = now - 30 * 24 * hourMs
-  else {
-    const midnight = new Date()
-    midnight.setHours(0, 0, 0, 0)
-    threshold = midnight.getTime()
+  for (const [dimension, buckets] of Object.entries(dimensions || {})) {
+    const sum = emptyBucket()
+    for (const [timeKey, bucket] of Object.entries(buckets || {})) {
+      const timestamp = hourly ? Number(timeKey) * hourMs : localDateStart(timeKey)
+      if (!Number.isFinite(timestamp)) continue
+      const bucketEnd = hourly ? timestamp + hourMs : timestamp + 86400000
+      if (bucketEnd <= start || timestamp >= end) continue
+      addIntoBucket(sum, bucket)
+      sum.lastAt = Math.max(Number(sum.lastAt || 0), timestamp)
+    }
+    if (sum.requests || sum.totalTokens) result[dimension] = sum
   }
-
-  const sum = { inputTokens: 0, outputTokens: 0, cachedTokens: 0, totalTokens: 0, requests: 0, latencySum: 0, latencyCount: 0, lastAt: 0 }
-  for (const [hourKey, bucket] of Object.entries(hourly)) {
-    const hourStart = Number(hourKey) * hourMs
-    if (hourStart + hourMs <= threshold) continue
-    sum.inputTokens += Number(bucket.inputTokens || 0)
-    sum.outputTokens += Number(bucket.outputTokens || 0)
-    sum.cachedTokens += Number(bucket.cachedTokens || 0)
-    sum.totalTokens += Number(bucket.totalTokens || 0)
-    sum.requests += Number(bucket.requests || 0)
-    sum.latencySum += Number(bucket.latencySum || 0)
-    sum.latencyCount += Number(bucket.latencyCount || 0)
-    if (hourStart > sum.lastAt) sum.lastAt = hourStart
-  }
-  return sum
+  return result
 }
 
-function renderUsageWindowRows() {
+function canonicalProviderId(key) {
+  const providers = state.config?.providers || []
+  return providers.find((provider) => provider.id === key || provider.name === key)?.id || key
+}
+
+function renderUsageWindowRows(byProvider = {}) {
   const rows = $('#usageWindowRows')
   if (!rows) return
-  const providerHourly = state.runtime?.usage?.providerHourly || {}
-  const entries = []
-
-  for (const provider of state.config?.providers || []) {
-    const agg = aggregateWindow(providerHourly[provider.id] || {}, state.usageWindow)
-    if (!agg.requests && !agg.totalTokens) continue
-    entries.push({ provider, agg })
-  }
+  const entries = Object.entries(byProvider)
+    .filter(([, agg]) => agg.requests || agg.totalTokens)
+    .map(([providerId, agg]) => ({
+      provider: state.config?.providers?.find((item) => item.id === providerId) || { id: providerId, name: providerName(providerId) },
+      agg,
+    }))
 
   entries.sort((a, b) => b.agg.totalTokens - a.agg.totalTokens)
-  rows.innerHTML = entries.length ? '' : '<div class="empty">该时间窗暂无消耗数据。</div>'
+  rows.innerHTML = entries.length ? '' : '<div class="empty">所选日期范围暂无消耗数据。</div>'
 
   for (const { provider, agg } of entries) {
     const avgLatency = agg.latencyCount ? Math.round(agg.latencySum / agg.latencyCount) : null
@@ -711,6 +1142,32 @@ function recordRangeThreshold(range) {
   return null
 }
 
+function getPageSlice(total, requestedPage, requestedPageSize) {
+  const pageSize = normalizePageSize(requestedPageSize)
+  const pageCount = Math.max(1, Math.ceil(total / pageSize))
+  const page = Math.min(Math.max(1, Number(requestedPage) || 1), pageCount)
+  const start = total ? (page - 1) * pageSize : 0
+  const end = Math.min(start + pageSize, total)
+  return { page, pageSize, pageCount, start, end }
+}
+
+function normalizePageSize(value) {
+  const number = Number(value)
+  return [20, 50, 100].includes(number) ? number : 20
+}
+
+function renderPager({ total, allTotal = null, page, infoNode, pageTextNode, prevNode, nextNode, sizeNode, emptyText }) {
+  const showing = total ? `${formatNumber(page.start + 1)}-${formatNumber(page.end)}` : '0'
+  const totalText = allTotal === null
+    ? `共 ${formatNumber(total)} 条`
+    : `共 ${formatNumber(total)} 条 / 全部 ${formatNumber(allTotal)} 条`
+  infoNode.textContent = total ? `显示 ${showing}，${totalText}` : `${emptyText}，${totalText}`
+  pageTextNode.textContent = `${page.page} / ${page.pageCount}`
+  prevNode.disabled = page.page <= 1
+  nextNode.disabled = page.page >= page.pageCount
+  setSelectValue(sizeNode, String(page.pageSize))
+}
+
 function exportRecordsCsv() {
   const rows = getFilteredRecords()
   const header = ['time', 'model', 'routedModel', 'provider', 'credential', 'ok', 'status', 'inputTokens', 'outputTokens', 'cachedTokens', 'totalTokens', 'durationMs', 'attempts']
@@ -770,7 +1227,20 @@ function aggregateLocalToday() {
 }
 
 function emptyBucket() {
-  return { inputTokens: 0, outputTokens: 0, cachedTokens: 0, cacheWriteTokens: 0, totalTokens: 0, requests: 0, latencySum: 0, latencyCount: 0 }
+  return {
+    inputTokens: 0,
+    outputTokens: 0,
+    cachedTokens: 0,
+    cacheWriteTokens: 0,
+    totalTokens: 0,
+    requests: 0,
+    cacheReportedRequests: 0,
+    cacheUnreportedRequests: 0,
+    estimatedRequests: 0,
+    latencySum: 0,
+    latencyCount: 0,
+    lastAt: 0,
+  }
 }
 
 function addIntoBucket(target, bucket = {}) {
@@ -780,8 +1250,12 @@ function addIntoBucket(target, bucket = {}) {
   target.cacheWriteTokens += Number(bucket.cacheWriteTokens || 0)
   target.totalTokens += Number(bucket.totalTokens || 0)
   target.requests += Number(bucket.requests || 0)
+  target.cacheReportedRequests += Number(bucket.cacheReportedRequests || 0)
+  target.cacheUnreportedRequests += Number(bucket.cacheUnreportedRequests || 0)
+  target.estimatedRequests += Number(bucket.estimatedRequests || 0)
   target.latencySum += Number(bucket.latencySum || 0)
   target.latencyCount += Number(bucket.latencyCount || 0)
+  target.lastAt = Math.max(Number(target.lastAt || 0), Number(bucket.lastAt || 0))
   return target
 }
 
@@ -896,7 +1370,7 @@ async function handleProviderAction(event) {
   if (!provider) return
 
   if (button.dataset.action === 'edit-provider') openProviderDialog(provider)
-  if (button.dataset.action === 'real-test') openRealTestDialog(provider, { autoRun: true })
+  if (button.dataset.action === 'real-test') openRealTestDialog(provider)
   if (button.dataset.action === 'set-start-provider') {
     state.runtime = await api('/api/routing/start', {
       method: 'POST',
@@ -978,20 +1452,24 @@ async function clearStartProvider() {
   toast('已清除路由起点')
 }
 
-function openRealTestDialog(provider, options = {}) {
+function openRealTestDialog(provider) {
   state.testingProvider = provider
   const form = $('#realTestForm')
   form.reset()
   $('#realTestDialogTitle').textContent = `真实转发测试：${provider.name}`
   formField(form, 'providerId').value = provider.id
-  formField(form, 'model').value = preferredRealTestModel(provider)
   formField(form, 'wireApi').value = 'provider'
   formField(form, 'prompt').value = 'Reply with exactly: OK'
   formField(form, 'maxTokens').value = 8
+  $('#realTestTimeoutHint').textContent = `本次最多等待 ${formatSeconds(state.config.service.providerRealTestTimeoutMs || 90000)}；不会套用该线路的日常转发超时。`
 
-  $('#realTestModelList').innerHTML = provider.models
-    .map((model) => `<option value="${escapeHtml(model)}"></option>`)
-    .join('')
+  const models = availableProviderModels(provider)
+  const modelSelect = formField(form, 'model')
+  modelSelect.innerHTML = models.length
+    ? models.map((model) => `<option value="${escapeHtml(model)}">${escapeHtml(model)}</option>`).join('')
+    : '<option value="">暂无已保存的支持模型</option>'
+  modelSelect.disabled = models.length === 0
+  modelSelect.value = preferredRealTestModel(provider)
 
   const enabledCredentials = (provider.credentials || []).filter((credential) => credential.enabled)
   const credentials = enabledCredentials.length ? enabledCredentials : provider.credentials || []
@@ -1003,9 +1481,13 @@ function openRealTestDialog(provider, options = {}) {
     `)
     .join('')
 
-  renderRealTestResult()
+  const runButton = $('#runRealTestBtn')
+  runButton.disabled = models.length === 0
+  renderRealTestResult(models.length ? null : {
+    skipped: true,
+    message: '当前线路没有已保存的支持模型，请先在线路列表中运行“测试”并写入模型。',
+  })
   $('#realTestDialog').showModal()
-  if (options.autoRun) runRealTestForForm(form)
 }
 
 async function runRealTest(event) {
@@ -1042,7 +1524,7 @@ async function runRealTestForForm(form) {
       message: error instanceof Error ? error.message : String(error),
     })
   } finally {
-    button.disabled = false
+    button.disabled = !formField(form, 'model').value
     button.textContent = '运行测试'
     await refreshState()
   }
@@ -1058,16 +1540,22 @@ function renderRealTestResult(result = null) {
 
   node.className = `real-test-result ${result.pending ? 'pending' : result.ok ? 'ok' : 'warn'}`
   if (result.pending) {
-    node.textContent = '正在向上游发起一次真实 chat/completions 请求...'
+    node.textContent = '正在向上游发起一次真实模型请求...'
+    return
+  }
+
+  if (result.skipped) {
+    node.textContent = result.message || '没有可用于真实测试的模型。'
     return
   }
 
   const usage = result.usage
-    ? `${formatTokenCompact(result.usage.totalTokens)} tokens，入 ${formatTokenCompact(result.usage.inputTokens)} / 出 ${formatTokenCompact(result.usage.outputTokens)} / 缓存 ${formatTokenCompact(result.usage.cachedTokens)}`
+    ? `${formatTokenCompact(result.usage.totalTokens)} tokens，入 ${formatTokenCompact(result.usage.inputTokens)} / 出 ${formatTokenCompact(result.usage.outputTokens)} / 缓存 ${cacheUsageText(result.usage)}`
     : '-'
   node.innerHTML = `
     <div><span class="label">状态</span><strong>${result.ok ? '成功' : '失败'} · HTTP ${result.status || 0}</strong></div>
     <div><span class="label">耗时</span><strong>${result.latencyMs || '-'} ms</strong></div>
+    <div><span class="label">测试时限</span><strong>${formatSeconds(result.timeoutMs || state.config.service.providerRealTestTimeoutMs || 90000)}</strong></div>
     <div><span class="label">模型</span><strong>${escapeHtml(result.model || '-')}</strong></div>
     <div><span class="label">Key 分组</span><strong>${escapeHtml(result.credentialLabel || '-')}</strong></div>
     <div class="wide"><span class="label">上游协议</span><strong>${wireApiLabel(result.wireApi)}</strong></div>
@@ -1120,7 +1608,7 @@ function openProviderDialog(provider = null) {
   formField(form, 'providerOutboundProxyMode').value = provider?.outboundProxyMode || 'inherit'
   formField(form, 'providerOutboundProxyUrl').value = provider?.outboundProxyUrl || ''
   formField(form, 'priority').value = provider?.priority ?? nextProviderPriority()
-  formField(form, 'timeoutMs').value = provider?.timeoutMs || state.config.service.requestTimeoutMs
+  formField(form, 'timeoutSeconds').value = Math.round((provider?.timeoutMs || state.config.service.requestTimeoutMs) / 1000)
   formField(form, 'cooldownSeconds').value = provider?.cooldownSeconds ?? state.config.service.defaultCooldownSeconds
   formField(form, 'models').value = provider?.models?.join(', ') || ''
   formField(form, 'tags').value = provider?.tags?.join(', ') || ''
@@ -1132,7 +1620,17 @@ function openProviderDialog(provider = null) {
     : [{ id: '', label: '默认', apiKeySet: false, apiKeyMasked: '', enabled: true, note: '' }]
   credentials.forEach((credential) => addCredentialRow(credential, provider?.activeCredentialId))
   renderProviderProxyFields()
+  renderProviderTimeoutHint()
   $('#providerDialog').showModal()
+}
+
+function renderProviderTimeoutHint() {
+  const seconds = Number(formField($('#providerForm'), 'timeoutSeconds').value)
+  const hint = $('#providerTimeoutHint')
+  hint.classList.toggle('warn', Number.isFinite(seconds) && seconds < 30)
+  hint.textContent = Number.isFinite(seconds) && seconds < 30
+    ? '低于 30 秒容易把慢线路误判为故障；建议 90 秒。线路测试仍使用全局测试时限。'
+    : '仅影响正常转发和故障切线，不影响线路测试；建议 90 秒。'
 }
 
 function renderProviderProxyFields() {
@@ -1154,7 +1652,7 @@ async function saveProvider(event) {
     outboundProxyMode: formField(form, 'providerOutboundProxyMode').value || 'inherit',
     outboundProxyUrl: formField(form, 'providerOutboundProxyUrl').value,
     priority: Number(formField(form, 'priority').value),
-    timeoutMs: Number(formField(form, 'timeoutMs').value),
+    timeoutMs: Number(formField(form, 'timeoutSeconds').value) * 1000,
     cooldownSeconds: Number(formField(form, 'cooldownSeconds').value),
     models: splitList(formField(form, 'models').value),
     tags: splitList(formField(form, 'tags').value),
@@ -1385,8 +1883,12 @@ async function saveSettings(event) {
       listenPort: Number(formField(form, 'listenPort').value),
       localApiKey: formField(form, 'localApiKey').value,
       requestTimeoutMs: Number(formField(form, 'requestTimeoutMs').value),
+      providerTestTimeoutMs: Number(formField(form, 'providerTestTimeoutSeconds').value) * 1000,
+      providerRealTestTimeoutMs: Number(formField(form, 'providerRealTestTimeoutSeconds').value) * 1000,
       maxAttempts: Number(formField(form, 'maxAttempts').value),
       defaultCooldownSeconds: Number(formField(form, 'defaultCooldownSeconds').value),
+      reconnectFailureThreshold: Number(formField(form, 'reconnectFailureThreshold').value),
+      reconnectCooldownSeconds: Number(formField(form, 'reconnectCooldownSeconds').value),
       retryStatusCodes: splitList(formField(form, 'retryStatusCodes').value).map(Number),
       logRequests: formField(form, 'logRequests').checked,
       collectUsage: formField(form, 'collectUsage').checked,
@@ -1514,6 +2016,9 @@ function lastProviderState(entry) {
   const bits = []
   if (entry.lastStatus) bits.push(`HTTP ${entry.lastStatus}`)
   if (entry.lastLatencyMs !== null && entry.lastLatencyMs !== undefined) bits.push(`${entry.lastLatencyMs} ms`)
+  if (entry.reconnectFailureCount) {
+    bits.push(`重连失败 ${entry.reconnectFailureCount}/${state.config?.service?.reconnectFailureThreshold || 4}`)
+  }
   if (entry.lastError) bits.push(escapeHtml(String(entry.lastError).slice(0, 80)))
   return bits.join('<br>') || '-'
 }
@@ -1633,21 +2138,68 @@ function outboundNoticeText(outbound) {
 
 function usageMini(usage) {
   if (!usage) return '<small>-</small>'
-  return `<strong>${formatTokenCompact(usage.totalTokens)}</strong><br><small>入 ${formatTokenCompact(usage.inputTokens)} / 出 ${formatTokenCompact(usage.outputTokens)}${usage.estimated ? ' · 估算' : ''}</small>`
+  return `<strong>${formatTokenCompact(usage.totalTokens)}</strong><br><small>入 ${formatTokenCompact(usage.inputTokens)} / 出 ${formatTokenCompact(usage.outputTokens)} / 缓存 ${cacheUsageText(usage)}${usage.estimated ? ' · 估算' : ''}</small>`
+}
+
+function cacheUsageText(usage = {}) {
+  const cachedTokens = Number(usage.cachedTokens || 0)
+  if (cachedTokens > 0) return formatTokenCompact(cachedTokens)
+  if (usage.estimated) return '未知'
+  if (usage.cachedTokensReported === true) return '0'
+  if (usage.cachedTokensReported === false) return '上游未上报'
+  return '历史未记录'
+}
+
+function cacheHitRateText(usage = {}) {
+  const inputTokens = Number(usage.inputTokens || 0)
+  const cachedTokens = Number(usage.cachedTokens || 0)
+  if (inputTokens <= 0) return '命中率 -'
+  return `命中率 ${Math.min(100, (cachedTokens / inputTokens) * 100).toFixed(1)}%`
+}
+
+function cacheCoverageText(usage = {}) {
+  const requests = Number(usage.requests || 0)
+  const reported = Number(usage.cacheReportedRequests || 0)
+  const unreported = Number(usage.cacheUnreportedRequests || 0)
+  const estimated = Number(usage.estimatedRequests || 0)
+  const classified = reported + unreported
+  if (!requests || !classified) return '历史累计未保存上报状态'
+  const unknown = Math.max(0, requests - classified)
+  const bits = [`可判断 ${classified}/${requests}`, `已上报 ${reported}`]
+  if (unreported) bits.push(`未上报 ${unreported}`)
+  if (unknown) bits.push(`历史未知 ${unknown}`)
+  if (estimated) bits.push(`估算 ${estimated}`)
+  return bits.join(' · ')
 }
 
 function logStatusPill(log) {
+  if (log?.outcome === 'real_test_success') return '<span class="pill info">测试成功</span>'
+  if (log?.outcome === 'real_test_failed') return '<span class="pill warn">测试失败</span>'
+  if (log?.outcome === 'tool_call_handoff') return '<span class="pill ok">工具调用</span>'
+  if (log?.outcome === 'response_complete') return '<span class="pill ok">成功</span>'
   if (isClientDisconnected(log)) return '<span class="pill warn">中断</span>'
   return log.ok ? '<span class="pill ok">成功</span>' : '<span class="pill warn">失败</span>'
 }
 
 function logStatusText(log) {
-  if (isClientDisconnected(log)) return `${log.status ?? '-'} / 客户端中断`
+  if (log?.outcome === 'real_test_success') return `${log.status ?? '-'} / 真实测试成功`
+  if (log?.outcome === 'real_test_failed') return `${log.status ?? '-'} / 真实测试失败`
+  if (log?.outcome === 'tool_call_handoff') return `${log.status ?? '-'} / 工具调用完成`
+  if (log?.outcome === 'response_complete') return `${log.status ?? '-'} / 响应已完成`
+  if (isClientDisconnected(log)) {
+    const attempt = (log.attempts || []).at(-1) || {}
+    if (attempt.failoverArmed) return `${log.status ?? '-'} / 重连 ${attempt.reconnectFailureThreshold || 4} 次，已切线`
+    if (attempt.reconnectFailureCount) {
+      return `${log.status ?? '-'} / 重连失败 ${attempt.reconnectFailureCount}/${attempt.reconnectFailureThreshold || 4}`
+    }
+    return `${log.status ?? '-'} / 客户端中断`
+  }
   return log.status ?? '-'
 }
 
 function isClientDisconnected(log) {
-  return String(log?.error || '').includes('Client disconnected')
+  return log?.outcome === 'client_disconnected' ||
+    String(log?.error || '').includes('Client disconnected')
 }
 
 function formatTokenCompact(value) {
@@ -1663,8 +2215,23 @@ function formatNumber(value) {
   return number ? number.toLocaleString() : '-'
 }
 
+function formatSeconds(milliseconds) {
+  const seconds = Number(milliseconds || 0) / 1000
+  return `${Number.isInteger(seconds) ? seconds : seconds.toFixed(1)} 秒`
+}
+
 function trimNumber(value) {
   return value >= 10 ? value.toFixed(1).replace(/\.0$/, '') : value.toFixed(2).replace(/0$/, '').replace(/\.0$/, '')
+}
+
+function sumValues(values = []) {
+  return values.reduce((sum, value) => sum + Number(value || 0), 0)
+}
+
+function percentText(value, total) {
+  if (!total) return '0%'
+  const percent = (Number(value || 0) / total) * 100
+  return percent >= 10 ? `${percent.toFixed(1)}%` : `${percent.toFixed(2).replace(/0$/, '').replace(/\.0$/, '')}%`
 }
 
 function calculateSuccessRate() {
@@ -1708,9 +2275,37 @@ function providerPatch(provider, priority = provider.priority) {
   }
 }
 
+function providerWebsiteLink(baseUrl) {
+  const displayUrl = String(baseUrl || '').trim()
+  const websiteUrl = providerWebsiteUrl(displayUrl)
+  if (!websiteUrl) return escapeHtml(displayUrl || '-')
+
+  return `
+    <a class="provider-url-link" href="${escapeHtml(websiteUrl)}" target="_blank" rel="noopener noreferrer" title="打开线路官网">
+      <span class="provider-url-text">${escapeHtml(displayUrl)}</span>
+      <span class="provider-url-mark" aria-hidden="true">↗</span>
+    </a>
+  `
+}
+
+function providerWebsiteUrl(baseUrl) {
+  try {
+    const url = new URL(String(baseUrl || '').trim())
+    return url.protocol === 'http:' || url.protocol === 'https:' ? url.origin : ''
+  } catch {
+    return ''
+  }
+}
+
 function preferredRealTestModel(provider) {
-  const models = provider.models || []
-  return models.find((model) => /mini|flash|lite|small/i.test(model)) || models[0] || 'gpt-4o-mini'
+  const models = availableProviderModels(provider)
+  return models.find((model) => /mini|flash|lite|small/i.test(model)) || models[0] || ''
+}
+
+function availableProviderModels(provider) {
+  return [...new Set((Array.isArray(provider.models) ? provider.models : [])
+    .map((model) => String(model).trim())
+    .filter(Boolean))]
 }
 
 function wireApiLabel(value) {
@@ -1752,6 +2347,20 @@ function uniqueSorted(values) {
 
 function localDateKey(date) {
   return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`
+}
+
+function localDateStart(dateKey) {
+  const [year, month, day] = String(dateKey || '').split('-').map(Number)
+  return new Date(year, month - 1, day).getTime()
+}
+
+function finiteDateKey(timestamp) {
+  return Number.isFinite(timestamp) ? localDateKey(new Date(timestamp)) : ''
+}
+
+function formatDateLabel(timestamp) {
+  const date = new Date(timestamp)
+  return `${date.getFullYear()}/${pad2(date.getMonth() + 1)}/${pad2(date.getDate())}`
 }
 
 function pad2(value) {

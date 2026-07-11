@@ -17,9 +17,13 @@ export const DEFAULT_CONFIG = {
     listenPort: 25818,
     localApiKey: 'local-relay',
     requestTimeoutMs: 90000,
-    retryStatusCodes: [401, 403, 408, 409, 425, 429, 500, 502, 503, 504],
+    providerTestTimeoutMs: 30000,
+    providerRealTestTimeoutMs: 90000,
+    retryStatusCodes: [401, 402, 403, 408, 409, 425, 429, 500, 502, 503, 504],
     maxAttempts: 8,
     defaultCooldownSeconds: 60,
+    reconnectFailureThreshold: 4,
+    reconnectCooldownSeconds: 600,
     logRequests: true,
     collectUsage: true,
     collectStreamUsage: true,
@@ -411,10 +415,34 @@ function normalizeConfig(value) {
 function normalizeService(input) {
   const listenPort = toPositiveInteger(input.listenPort, DEFAULT_CONFIG.service.listenPort)
   const requestTimeoutMs = toPositiveInteger(input.requestTimeoutMs, DEFAULT_CONFIG.service.requestTimeoutMs)
+  const providerTestTimeoutMs = clampInteger(
+    input.providerTestTimeoutMs,
+    3000,
+    120000,
+    DEFAULT_CONFIG.service.providerTestTimeoutMs,
+  )
+  const providerRealTestTimeoutMs = clampInteger(
+    input.providerRealTestTimeoutMs,
+    5000,
+    300000,
+    DEFAULT_CONFIG.service.providerRealTestTimeoutMs,
+  )
   const maxAttempts = toPositiveInteger(input.maxAttempts, DEFAULT_CONFIG.service.maxAttempts)
   const defaultCooldownSeconds = toNonNegativeInteger(
     input.defaultCooldownSeconds,
     DEFAULT_CONFIG.service.defaultCooldownSeconds,
+  )
+  const reconnectFailureThreshold = clampInteger(
+    input.reconnectFailureThreshold,
+    1,
+    20,
+    DEFAULT_CONFIG.service.reconnectFailureThreshold,
+  )
+  const reconnectCooldownSeconds = clampInteger(
+    input.reconnectCooldownSeconds,
+    30,
+    10800,
+    DEFAULT_CONFIG.service.reconnectCooldownSeconds,
   )
   const outboundProxyMode = normalizeOutboundProxyMode(input.outboundProxyMode)
   const outboundProxyUrl = normalizeProxyUrl(input.outboundProxyUrl)
@@ -425,9 +453,13 @@ function normalizeService(input) {
     listenPort,
     localApiKey: toText(input.localApiKey, DEFAULT_CONFIG.service.localApiKey),
     requestTimeoutMs,
+    providerTestTimeoutMs,
+    providerRealTestTimeoutMs,
     retryStatusCodes: normalizeStatusCodes(input.retryStatusCodes),
     maxAttempts,
     defaultCooldownSeconds,
+    reconnectFailureThreshold,
+    reconnectCooldownSeconds,
     logRequests: input.logRequests !== false,
     collectUsage: input.collectUsage !== false,
     collectStreamUsage: input.collectStreamUsage !== false,
@@ -487,7 +519,7 @@ function normalizeProvider(input) {
     outboundProxyUrl,
     enabled: input.enabled !== false,
     priority: toNonNegativeInteger(input.priority, 100),
-    timeoutMs: toPositiveInteger(input.timeoutMs, DEFAULT_CONFIG.service.requestTimeoutMs),
+    timeoutMs: clampInteger(input.timeoutMs, 5000, 300000, DEFAULT_CONFIG.service.requestTimeoutMs),
     cooldownSeconds: toNonNegativeInteger(input.cooldownSeconds, DEFAULT_CONFIG.service.defaultCooldownSeconds),
     models: normalizeStringList(input.models),
     tags: normalizeStringList(input.tags),

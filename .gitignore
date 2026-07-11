@@ -1,7 +1,12 @@
 data/config.json
 data/state.json
+data/backups/
 logs/
 work/
+node_modules/
 *.log
 *.tmp
+*.bak.*
 .env
+.DS_Store
+Thumbs.db

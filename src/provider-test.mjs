@@ -14,7 +14,8 @@ export async function testProvider(provider, model = null, serviceConfig = {}) {
   const selectedModel = model || provider.models[0] || 'gpt-4o-mini'
   const startedAt = Date.now()
   const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort(), provider.timeoutMs || 30000)
+  const timeoutMs = resolveTestTimeout(serviceConfig.providerTestTimeoutMs, 3000, 120000, 30000)
+  const timeout = setTimeout(() => controller.abort(), timeoutMs)
 
   try {
     const response = await upstreamFetch(buildModelsUrl(provider.baseUrl), {
@@ -31,18 +32,24 @@ export async function testProvider(provider, model = null, serviceConfig = {}) {
       latencyMs: Date.now() - startedAt,
       model: selectedModel,
       models,
+      timeoutMs,
       message: response.ok
         ? `Provider responded to /v1/models. ${models.length} model(s) found.`
         : await safeText(response),
     }
   } catch (error) {
+    const timedOut = controller.signal.aborted
     return {
       ok: false,
       status: 0,
       latencyMs: Date.now() - startedAt,
       model: selectedModel,
       models: [],
-      message: error instanceof Error ? error.message : String(error),
+      timeoutMs,
+      reason: timedOut ? 'local_timeout' : 'network_error',
+      message: timedOut
+        ? `Local connectivity test timed out after ${timeoutMs} ms before /v1/models responded.`
+        : error instanceof Error ? error.message : String(error),
     }
   } finally {
     clearTimeout(timeout)
@@ -54,21 +61,65 @@ export async function realTestProvider(provider, input = {}, serviceConfig = {})
   const testProvider = selectedCredential
     ? { ...provider, activeCredentialId: selectedCredential.id }
     : provider
-  const selectedModel = normalizeText(input.model) || preferredRealTestModel(provider)
+  const availableModels = availableProviderModels(provider)
+  const requestedModel = normalizeText(input.model)
+  const selectedModel = requestedModel || preferredRealTestModel(availableModels)
   const prompt = normalizeText(input.prompt) || 'Reply with exactly: OK'
   const maxTokens = clampInteger(input.maxTokens, 1, 128, 8)
   const startedAt = Date.now()
   const wireApi = normalizeWireApi(input.wireApi) || provider.wireApi || 'chat'
+  const timeoutMs = resolveTestTimeout(serviceConfig.providerRealTestTimeoutMs, 5000, 300000, 90000)
 
-  const first = await sendChatCompletion(testProvider, selectedModel, prompt, maxTokens, 'max_tokens', wireApi, serviceConfig)
+  if (!availableModels.length) {
+    return skippedRealTestResult({
+      provider,
+      selectedCredential,
+      selectedModel,
+      wireApi,
+      reason: 'no_supported_models',
+      message: 'No supported models are configured for this provider.',
+    })
+  }
+
+  if (!availableModels.includes(selectedModel)) {
+    return skippedRealTestResult({
+      provider,
+      selectedCredential,
+      selectedModel,
+      wireApi,
+      reason: 'unsupported_model',
+      message: 'The selected model is not in this provider supported model list.',
+    })
+  }
+
+  const first = await sendChatCompletion(
+    testProvider,
+    selectedModel,
+    prompt,
+    maxTokens,
+    'max_tokens',
+    wireApi,
+    serviceConfig,
+    timeoutMs,
+  )
   if (!first.ok && /max_tokens|max_completion_tokens/i.test(first.message || '')) {
-    const retry = await sendChatCompletion(testProvider, selectedModel, prompt, maxTokens, 'max_completion_tokens', wireApi, serviceConfig)
+    const retry = await sendChatCompletion(
+      testProvider,
+      selectedModel,
+      prompt,
+      maxTokens,
+      'max_completion_tokens',
+      wireApi,
+      serviceConfig,
+      timeoutMs,
+    )
     return {
       ...retry,
       credentialId: selectedCredential?.id || provider.activeCredentialId || '',
       credentialLabel: selectedCredential?.label || '',
       wireApi,
       model: selectedModel,
+      timeoutMs,
       retriedWith: 'max_completion_tokens',
       latencyMs: Date.now() - startedAt,
     }
@@ -80,6 +131,7 @@ export async function realTestProvider(provider, input = {}, serviceConfig = {})
     credentialLabel: selectedCredential?.label || '',
     wireApi,
     model: selectedModel,
+    timeoutMs,
     latencyMs: Date.now() - startedAt,
   }
 }
@@ -99,7 +151,8 @@ export async function syncProviderCredentialUsage(provider, input = {}, serviceC
   const testProvider = { ...provider, activeCredentialId: selectedCredential.id }
   const startedAt = Date.now()
   const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort(), provider.timeoutMs || 30000)
+  const timeoutMs = resolveTestTimeout(serviceConfig.providerTestTimeoutMs, 3000, 120000, 30000)
+  const timeout = setTimeout(() => controller.abort(), timeoutMs)
 
   try {
     const response = await upstreamFetch(buildUserSelfUrl(provider.baseUrl), {
@@ -127,27 +180,33 @@ export async function syncProviderCredentialUsage(provider, input = {}, serviceC
       credentialId: selectedCredential.id,
       credentialLabel: selectedCredential.label || '',
       latencyMs: Date.now() - startedAt,
+      timeoutMs,
       snapshot,
       message: response.ok && hasSnapshotData ? 'ok' : preview(text || 'No upstream usage fields were returned.'),
     }
   } catch (error) {
+    const timedOut = controller.signal.aborted
     return {
       ok: false,
       status: 0,
       credentialId: selectedCredential.id,
       credentialLabel: selectedCredential.label || '',
       latencyMs: Date.now() - startedAt,
+      timeoutMs,
       snapshot: null,
-      message: error instanceof Error ? error.message : String(error),
+      reason: timedOut ? 'local_timeout' : 'network_error',
+      message: timedOut
+        ? `Local usage sync timed out after ${timeoutMs} ms before the upstream response was received.`
+        : error instanceof Error ? error.message : String(error),
     }
   } finally {
     clearTimeout(timeout)
   }
 }
 
-async function sendChatCompletion(provider, model, prompt, maxTokens, tokenField, wireApi, serviceConfig) {
+async function sendChatCompletion(provider, model, prompt, maxTokens, tokenField, wireApi, serviceConfig, timeoutMs) {
   const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort(), provider.timeoutMs || 30000)
+  const timeout = setTimeout(() => controller.abort(), timeoutMs)
 
   try {
     const requestUrl = '/v1/chat/completions'
@@ -183,17 +242,25 @@ async function sendChatCompletion(provider, model, prompt, maxTokens, tokenField
       message: response.ok ? 'ok' : preview(text || `HTTP ${response.status}`),
     }
   } catch (error) {
+    const timedOut = controller.signal.aborted
     return {
       ok: false,
       status: 0,
       content: '',
       usage: null,
       rawUsage: null,
-      message: error instanceof Error ? error.message : String(error),
+      reason: timedOut ? 'local_timeout' : 'network_error',
+      message: timedOut
+        ? `Local real test timed out after ${timeoutMs} ms before the upstream response was received.`
+        : error instanceof Error ? error.message : String(error),
     }
   } finally {
     clearTimeout(timeout)
   }
+}
+
+function resolveTestTimeout(value, min, max, fallback) {
+  return clampInteger(value, min, max, fallback)
 }
 
 function buildModelsUrl(baseUrl) {
@@ -293,9 +360,32 @@ function clampInteger(value, min, max, fallback) {
   return Math.min(max, Math.max(min, number))
 }
 
-function preferredRealTestModel(provider) {
-  const models = Array.isArray(provider.models) ? provider.models : []
-  return models.find((model) => /mini|flash|lite|small/i.test(model)) || models[0] || 'gpt-4o-mini'
+function preferredRealTestModel(models) {
+  return models.find((model) => /mini|flash|lite|small/i.test(model)) || models[0] || ''
+}
+
+function availableProviderModels(provider) {
+  return [...new Set((Array.isArray(provider.models) ? provider.models : [])
+    .map((model) => String(model).trim())
+    .filter(Boolean))]
+}
+
+function skippedRealTestResult({ provider, selectedCredential, selectedModel, wireApi, reason, message }) {
+  return {
+    ok: false,
+    skipped: true,
+    reason,
+    status: 400,
+    latencyMs: 0,
+    model: selectedModel,
+    credentialId: selectedCredential?.id || provider.activeCredentialId || '',
+    credentialLabel: selectedCredential?.label || '',
+    wireApi,
+    content: '',
+    usage: null,
+    rawUsage: null,
+    message,
+  }
 }
 
 function preview(value, maxLength = 500) {

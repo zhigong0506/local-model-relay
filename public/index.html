@@ -59,6 +59,7 @@
         <aside class="side">
           <button class="tab" type="button" data-tab="dashboard">仪表盘</button>
           <button class="tab active" type="button" data-tab="providers">线路</button>
+          <button class="tab" type="button" data-tab="speed">测速</button>
           <button class="tab" type="button" data-tab="routes">模型</button>
           <button class="tab" type="button" data-tab="usage">用量</button>
           <button class="tab" type="button" data-tab="records">记录</button>
@@ -189,6 +190,94 @@
           </div>
         </section>
 
+        <section class="panel" id="speedPanel">
+          <div class="panel-head">
+            <div>
+              <h2>端口速度测试</h2>
+              <p>临时粘贴 Base URL 和 Key，选择模型后测首字延迟、总耗时和输出速度；不会保存密钥。</p>
+            </div>
+          </div>
+          <div class="speed-test-layout">
+            <form id="speedTestForm" class="speed-test-form">
+              <label>
+                <span>Base URL</span>
+                <input name="baseUrl" required autocomplete="off" placeholder="https://example.com 或 https://example.com/v1">
+              </label>
+              <label class="secret-field">
+                <span>API Key</span>
+                <input name="apiKey" required type="password" autocomplete="off" placeholder="仅用于本次测速，不保存">
+              </label>
+              <div class="speed-row">
+                <label>
+                  <span>上游协议</span>
+                  <select name="wireApi">
+                    <option value="chat">Chat Completions</option>
+                    <option value="responses">Responses</option>
+                  </select>
+                </label>
+                <label>
+                  <span>出站方式</span>
+                  <select name="proxyMode">
+                    <option value="inherit">跟随全局</option>
+                    <option value="direct">直连</option>
+                    <option value="system">系统代理</option>
+                    <option value="custom">自定义代理</option>
+                  </select>
+                </label>
+              </div>
+              <label id="speedProxyUrlField" hidden>
+                <span>自定义代理</span>
+                <input name="proxyUrl" autocomplete="off" placeholder="http://127.0.0.1:7897">
+              </label>
+              <div class="speed-model-row">
+                <label>
+                  <span>模型</span>
+                  <input name="model" list="speedModelOptions" required autocomplete="off" placeholder="先获取模型，或直接粘贴模型名">
+                  <datalist id="speedModelOptions"></datalist>
+                </label>
+                <button id="fetchSpeedModelsBtn" class="ghost" type="button">获取模型</button>
+              </div>
+              <div class="speed-row">
+                <label>
+                  <span>轮数</span>
+                  <input name="rounds" type="number" min="1" max="10" value="3">
+                </label>
+                <label>
+                  <span>最大输出 Token</span>
+                  <input name="maxTokens" type="number" min="1" max="1024" value="64">
+                </label>
+                <label>
+                  <span>超时 ms</span>
+                  <input name="timeoutMs" type="number" min="3000" max="180000" value="60000">
+                </label>
+              </div>
+              <label>
+                <span>测试提示词</span>
+                <textarea name="prompt" rows="3">Reply with exactly: OK</textarea>
+              </label>
+              <div class="form-actions">
+                <button id="runSpeedTestBtn" class="primary" type="submit">开始测速</button>
+                <button id="clearSpeedTestBtn" class="ghost" type="button">清空结果</button>
+              </div>
+            </form>
+            <section class="speed-result-card">
+              <div class="chart-head">
+                <h3>测速结果</h3>
+                <span id="speedTestStatus">等待测试</span>
+              </div>
+              <div id="speedSummary" class="speed-summary">
+                <div><span class="label">首字延迟</span><strong>-</strong></div>
+                <div><span class="label">总耗时</span><strong>-</strong></div>
+                <div><span class="label">输出速度</span><strong>-</strong></div>
+                <div><span class="label">成功轮次</span><strong>-</strong></div>
+              </div>
+              <div id="speedResultRows" class="speed-result-rows">
+                <div class="empty">还没有测速结果。</div>
+              </div>
+            </section>
+          </div>
+        </section>
+
         <section class="panel" id="routesPanel">
           <div class="panel-head">
             <div>
@@ -241,12 +330,31 @@
               <input name="requestTimeoutMs" type="number" min="1000">
             </label>
             <label>
+              <span>快速连通测试（秒）</span>
+              <input name="providerTestTimeoutSeconds" type="number" min="3" max="120" step="1">
+              <small class="field-hint">用于模型列表和额度探测，默认 30 秒。</small>
+            </label>
+            <label>
+              <span>真实生成测试（秒）</span>
+              <input name="providerRealTestTimeoutSeconds" type="number" min="5" max="300" step="1">
+              <small class="field-hint">独立于日常转发超时，默认 90 秒。</small>
+            </label>
+            <label>
               <span>最大尝试次数</span>
               <input name="maxAttempts" type="number" min="1">
             </label>
             <label>
               <span>默认冷却秒数</span>
               <input name="defaultCooldownSeconds" type="number" min="0">
+            </label>
+            <label>
+              <span>流中断重连阈值</span>
+              <input name="reconnectFailureThreshold" type="number" min="1" max="20">
+              <small class="field-hint">输出前失败会在同一请求内直接换线；输出后中断由 Codex 自动重连并累计。</small>
+            </label>
+            <label>
+              <span>重连切线冷却秒数</span>
+              <input name="reconnectCooldownSeconds" type="number" min="30" max="10800">
             </label>
             <label class="wide">
               <span>可切换 HTTP 状态码</span>
@@ -325,23 +433,77 @@
               <strong id="usageInOut">-</strong>
             </div>
             <div>
-              <span class="label">缓存读取</span>
+              <span class="label">缓存读取 / 输入命中率</span>
               <strong id="usageCached">-</strong>
+              <small id="usageCacheCoverage">-</small>
             </div>
             <div>
               <span class="label">请求数</span>
               <strong id="usageRequests">-</strong>
             </div>
           </div>
+          <div class="usage-range-toolbar">
+            <div>
+              <strong>图表统计范围</strong>
+              <span>模型、线路占比与线路消耗共用同一范围，小时与日期统计独立持久化</span>
+            </div>
+            <div id="usageRangePicker" class="usage-range-picker">
+              <button id="usageRangeButton" class="usage-range-button" type="button" aria-haspopup="dialog" aria-expanded="false">
+                <span class="usage-range-calendar" aria-hidden="true"></span>
+                <span id="usageRangeLabel">近 24 小时</span>
+                <span class="usage-range-chevron" aria-hidden="true"></span>
+              </button>
+              <div id="usageRangeMenu" class="usage-range-menu" role="dialog" aria-label="选择 Token 统计日期范围" hidden>
+                <div class="usage-range-shortcuts" role="group" aria-label="快捷日期范围">
+                  <button type="button" data-usage-range="today">今天</button>
+                  <button type="button" data-usage-range="yesterday">昨天</button>
+                  <button class="active" type="button" data-usage-range="24h">近 24 小时</button>
+                  <button type="button" data-usage-range="7d">近 7 天</button>
+                  <button type="button" data-usage-range="14d">近 14 天</button>
+                  <button type="button" data-usage-range="30d">近 30 天</button>
+                  <button type="button" data-usage-range="thisMonth">本月</button>
+                  <button type="button" data-usage-range="lastMonth">上月</button>
+                  <button type="button" data-usage-range="all">全部记录</button>
+                  <button type="button" data-usage-range="custom">自定义</button>
+                </div>
+                <div class="usage-range-custom">
+                  <label>
+                    <span>开始日期</span>
+                    <input id="usageRangeStart" type="date">
+                  </label>
+                  <span class="usage-range-arrow" aria-hidden="true">→</span>
+                  <label>
+                    <span>结束日期</span>
+                    <input id="usageRangeEnd" type="date">
+                  </label>
+                </div>
+                <div class="usage-range-actions">
+                  <span id="usageRangeHint">结束日期包含当天</span>
+                  <button id="usageRangeApply" class="primary" type="button">应用日期</button>
+                </div>
+              </div>
+            </div>
+          </div>
+          <section class="usage-chart-grid">
+            <div class="chart-card">
+              <div class="chart-head">
+                <h3>模型 Token 占比</h3>
+                <span id="usageModelShareRange">近 24 小时 · Top 8</span>
+              </div>
+              <canvas id="usageModelShareChart" height="210"></canvas>
+            </div>
+            <div class="chart-card">
+              <div class="chart-head">
+                <h3>线路 Token 占比</h3>
+                <span id="usageProviderShareRange">近 24 小时 · Top 8</span>
+              </div>
+              <canvas id="usageProviderShareChart" height="210"></canvas>
+            </div>
+          </section>
           <section class="usage-window-block">
             <div class="usage-window-head">
               <h3>各线路时间窗消耗</h3>
-              <div id="usageWindowTabs" class="window-tabs" role="tablist">
-                <button class="window-tab active" type="button" data-window="today">今天</button>
-                <button class="window-tab" type="button" data-window="24h">近 24 小时</button>
-                <button class="window-tab" type="button" data-window="7d">近 7 天</button>
-                <button class="window-tab" type="button" data-window="30d">近 30 天</button>
-              </div>
+              <span id="usageWindowRange" class="usage-window-range">近 24 小时</span>
             </div>
             <div id="usageWindowRows" class="usage-list window"></div>
           </section>
@@ -372,6 +534,22 @@
               <p>只记录必要元数据，不记录请求正文和密钥。</p>
             </div>
             <button id="clearLogsBtn" class="ghost" type="button">清空记录</button>
+          </div>
+          <div class="pager" id="logPager">
+            <div class="pager-info" id="logPagerInfo">-</div>
+            <div class="pager-controls">
+              <label>
+                <span>每页</span>
+                <select id="logPageSize" class="inline-select" aria-label="日志每页条数">
+                  <option value="20">20</option>
+                  <option value="50">50</option>
+                  <option value="100">100</option>
+                </select>
+              </label>
+              <button id="logPrevPage" class="ghost" type="button">上一页</button>
+              <span id="logPageText">-</span>
+              <button id="logNextPage" class="ghost" type="button">下一页</button>
+            </div>
           </div>
           <div id="logList" class="log-list"></div>
         </section>
@@ -408,7 +586,22 @@
               <option value="latency">耗时最高</option>
             </select>
           </div>
-          <div class="record-count" id="recordCount">-</div>
+          <div class="pager record-pager" id="recordPager">
+            <div class="pager-info" id="recordCount">-</div>
+            <div class="pager-controls">
+              <label>
+                <span>每页</span>
+                <select id="recordPageSize" class="inline-select" aria-label="记录每页条数">
+                  <option value="20">20</option>
+                  <option value="50">50</option>
+                  <option value="100">100</option>
+                </select>
+              </label>
+              <button id="recordPrevPage" class="ghost" type="button">上一页</button>
+              <span id="recordPageText">-</span>
+              <button id="recordNextPage" class="ghost" type="button">下一页</button>
+            </div>
+          </div>
           <div class="table-wrap record-table-wrap">
             <table class="records-table">
               <thead>
@@ -476,8 +669,9 @@
             <input name="priority" type="number" min="0">
           </label>
           <label>
-            <span>超时 ms</span>
-            <input name="timeoutMs" type="number" min="1000">
+            <span>日常转发超时（秒）</span>
+            <input name="timeoutSeconds" type="number" min="5" max="300" step="1">
+            <small id="providerTimeoutHint" class="field-hint">仅影响正常转发和故障切线，不影响线路测试。</small>
           </label>
         </div>
         <div class="two">
@@ -540,8 +734,7 @@
         <div class="two">
           <label>
             <span>模型</span>
-            <input name="model" list="realTestModelList" required autocomplete="off">
-            <datalist id="realTestModelList"></datalist>
+            <select name="model" required></select>
           </label>
           <label>
             <span>上游协议</span>
@@ -566,6 +759,7 @@
           <span>测试提示词</span>
           <textarea name="prompt" rows="3">Reply with exactly: OK</textarea>
         </label>
+        <div id="realTestTimeoutHint" class="test-timeout-hint"></div>
         <div id="realTestResult" class="real-test-result empty">尚未运行真实转发测试。</div>
         <div class="form-actions">
           <button id="runRealTestBtn" class="primary" type="submit">运行测试</button>
