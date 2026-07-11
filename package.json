@@ -1,6 +1,6 @@
 {
   "name": "local-model-relay",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Local OpenAI-compatible relay with provider routing, failover, usage tracking, and a browser control panel.",
   "private": true,
   "license": "MIT",
@@ -8,17 +8,18 @@
   "type": "module",
   "scripts": {
     "start": "node scripts/launch-server.mjs",
-    "check": "node --check src/server.mjs && node --check src/config-store.mjs && node --check src/state-store.mjs && node --check src/proxy.mjs && node --check src/provider-test.mjs && node --check src/speed-test.mjs && node --check src/wire-api.mjs && node --check src/usage.mjs && node --check src/outbound-proxy.mjs && node --check src/upstream-fetch.mjs && node --check public/js/main.mjs && node --check scripts/launch-server.mjs && node --check scripts/run-isolated-e2e.mjs && node --check scripts/failover-e2e.mjs && node --check scripts/reconnect-failover-e2e.mjs && node --check scripts/stream-preface-failover-e2e.mjs && node --check scripts/usage-estimate-e2e.mjs && node --check scripts/usage-cache-fields-test.mjs && node --check scripts/outbound-proxy-e2e.mjs && node --check scripts/sticky-routing-e2e.mjs && node --check scripts/codex-compat-e2e.mjs && node --check scripts/real-test-model-e2e.mjs",
+    "check": "node --check src/server.mjs && node --check src/config-store.mjs && node --check src/state-store.mjs && node --check src/proxy.mjs && node --check src/provider-test.mjs && node --check src/speed-test.mjs && node --check src/wire-api.mjs && node --check src/usage.mjs && node --check src/outbound-proxy.mjs && node --check src/upstream-fetch.mjs && node --check public/js/main.mjs && node --check scripts/launch-server.mjs && node --check scripts/run-isolated-e2e.mjs && node --check scripts/failover-e2e.mjs && node --check scripts/reconnect-failover-e2e.mjs && node --check scripts/stream-preface-failover-e2e.mjs && node --check scripts/quota-exhaustion-long-task-e2e.mjs && node --check scripts/usage-estimate-e2e.mjs && node --check scripts/usage-cache-fields-test.mjs && node --check scripts/outbound-proxy-e2e.mjs && node --check scripts/sticky-routing-e2e.mjs && node --check scripts/codex-compat-e2e.mjs && node --check scripts/real-test-model-e2e.mjs",
     "test:failover": "node scripts/run-isolated-e2e.mjs scripts/failover-e2e.mjs",
     "test:reconnect-failover": "node scripts/run-isolated-e2e.mjs scripts/reconnect-failover-e2e.mjs",
     "test:stream-preface-failover": "node scripts/run-isolated-e2e.mjs scripts/stream-preface-failover-e2e.mjs",
+    "test:quota-exhaustion": "node scripts/run-isolated-e2e.mjs scripts/quota-exhaustion-long-task-e2e.mjs",
     "test:usage-estimate": "node scripts/run-isolated-e2e.mjs scripts/usage-estimate-e2e.mjs",
     "test:usage-cache": "node scripts/usage-cache-fields-test.mjs",
     "test:outbound-proxy": "node scripts/outbound-proxy-e2e.mjs",
     "test:sticky-routing": "node scripts/run-isolated-e2e.mjs scripts/sticky-routing-e2e.mjs",
     "test:codex-compat": "node scripts/run-isolated-e2e.mjs scripts/codex-compat-e2e.mjs",
     "test:real-test-model": "node scripts/run-isolated-e2e.mjs scripts/real-test-model-e2e.mjs",
-    "test:all": "npm run check && npm run test:usage-cache && npm run test:outbound-proxy && npm run test:failover && npm run test:stream-preface-failover && npm run test:reconnect-failover && npm run test:usage-estimate && npm run test:sticky-routing && npm run test:codex-compat && npm run test:real-test-model"
+    "test:all": "npm run check && npm run test:usage-cache && npm run test:outbound-proxy && npm run test:failover && npm run test:stream-preface-failover && npm run test:quota-exhaustion && npm run test:reconnect-failover && npm run test:usage-estimate && npm run test:sticky-routing && npm run test:codex-compat && npm run test:real-test-model"
   },
   "engines": {
     "node": ">=20"

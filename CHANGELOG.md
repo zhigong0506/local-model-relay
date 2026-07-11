@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.1 - 2026-07-11
+
+- Added a long-task quota-exhaustion regression test: a provider completes
+  several streamed Responses turns, returns HTTP 402, then the same request
+  falls through to a backup and later requests skip the cooling provider.
+
 ## 0.2.0 - 2026-07-11
 
 - Added modern dashboard, request records, pagination, date-range usage charts,

@@ -145,9 +145,10 @@ shortcut.
 npm run test:all
 ```
 
-The suite covers status-code failover, stream failure and idle-stream failover,
-Codex text/tool compatibility, reconnect circuit breaking, sticky routing,
-proxy behavior, cache fields, usage estimates, and real-test model selection.
+The suite covers status-code failover, long-task quota exhaustion failover,
+stream failure and idle-stream failover, Codex text/tool compatibility,
+reconnect circuit breaking, sticky routing, proxy behavior, cache fields, usage
+estimates, and real-test model selection.
 E2E tests run on random local ports with temporary data directories, so they do
 not alter the user's running providers, routes, logs, or usage totals.
 
