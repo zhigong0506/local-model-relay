@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.0 - 2026-07-12
+
+- Added actionable per-request diagnostics for disabled or unavailable keys,
+  routing skips, common upstream HTTP and network failures, and stream failures.
+- Treat HTTP 200 responses containing upstream error payloads as failures across
+  relay forwarding, provider tests, and speed tests, allowing safe failover.
+- Added TLS and connect-socket error guards so late socket errors cannot crash
+  the local relay process.
+- Added light/dark theme support that follows the system by default and can be
+  overridden manually, plus compact share charts with external legends.
+- Added regression coverage for diagnostics, disabled-key routing, HTTP 200
+  error payloads, socket protection, configuration boundaries, and theme/chart UI.
+
 ## 0.2.2 - 2026-07-11
 
 - Replaced native model dropdowns with searchable in-app model pickers for

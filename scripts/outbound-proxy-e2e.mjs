@@ -9,6 +9,7 @@ import {
 const proxyHits = []
 const connectHits = []
 const directHits = []
+let tlsResetHits = 0
 const proxy = await startProxy()
 const direct = await startDirectServer()
 
@@ -58,18 +59,26 @@ try {
       } catch {
         httpsErrored = true
       }
+      let tlsResetErrored = false
+      try {
+        await upstreamFetch('https://proxy-reset.invalid/v1/models', { proxyUrl: '${proxyUrl}' })
+      } catch {
+        tlsResetErrored = true
+      }
       const direct = await upstreamFetch('http://127.0.0.1:${direct.address().port}/ping', { proxyUrl: '${proxyUrl}' }).then((r) => r.text())
-      console.log(JSON.stringify({ proxied, httpsErrored, direct }))
+      console.log(JSON.stringify({ proxied, httpsErrored, tlsResetErrored, direct }))
     `,
   ], plan.env)
 
-  const childReport = JSON.parse(result.stdout.trim())
-  const report = {
-    ok: proxyHits.length === 1 &&
-      connectHits.length === 1 &&
+    const childReport = JSON.parse(result.stdout.trim())
+    const report = {
+      ok: proxyHits.length === 1 &&
+      connectHits.length === 2 &&
+      tlsResetHits === 1 &&
       directHits.length === 1 &&
       childReport.proxied.ok === true &&
       childReport.httpsErrored === true &&
+      childReport.tlsResetErrored === true &&
       childReport.direct === 'DIRECT_OK',
     providerResolution: {
       inherited: inherited.effectiveMode,
@@ -78,6 +87,7 @@ try {
     },
     proxyHits,
     connectHits,
+    tlsResetHits,
     directHits,
     childReport,
   }
@@ -98,6 +108,12 @@ function startProxy() {
   })
   server.on('connect', (req, socket) => {
     connectHits.push({ method: 'CONNECT', url: req.url })
+    if (req.url === 'proxy-reset.invalid:443') {
+      tlsResetHits += 1
+      socket.write('HTTP/1.1 200 Connection Established\r\n\r\n')
+      setTimeout(() => socket.destroy(), 25)
+      return
+    }
     socket.write('HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n')
     socket.destroy()
   })

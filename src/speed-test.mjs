@@ -1,6 +1,7 @@
 import { getCachedSystemProxy, resolveProviderOutboundProxy } from './outbound-proxy.mjs'
 import { upstreamFetch } from './upstream-fetch.mjs'
 import { normalizeUsagePayload } from './wire-api.mjs'
+import { hasCompletionPayload, upstreamErrorMessage } from './response-validation.mjs'
 
 const DEFAULT_PROMPT = 'Reply with exactly: OK'
 
@@ -26,12 +27,16 @@ export async function fetchSpeedTestModels(input = {}, serviceConfig = {}) {
     const models = Array.isArray(payload?.data)
       ? [...new Set(payload.data.map((item) => normalizeText(item?.id)).filter(Boolean))].sort()
       : []
+    const errorMessage = upstreamErrorMessage(payload)
+    const valid = Boolean(payload && Array.isArray(payload.data) && !errorMessage)
     return {
-      ok: response.ok,
+      ok: response.ok && valid,
       status: response.status,
       latencyMs: Date.now() - startedAt,
       models,
-      message: response.ok ? `发现 ${models.length} 个模型。` : preview(text || `HTTP ${response.status}`),
+      message: response.ok && valid
+        ? `发现 ${models.length} 个模型。`
+        : errorMessage || preview(text || `HTTP ${response.status}`),
     }
   } catch (error) {
     return speedErrorResult(error, controller.signal.aborted, Date.now() - startedAt, input.timeoutMs)
@@ -110,9 +115,11 @@ async function runOneRound(detail) {
     const totalMs = Date.now() - startedAt
     const generationMs = parsed.firstTokenMs === null ? totalMs : Math.max(1, totalMs - parsed.firstTokenMs)
     const outputTokens = Number(parsed.usage?.outputTokens || 0) || estimateTokens(parsed.text)
+    const errorMessage = parsed.errorText || ''
+    const ok = response.ok && !errorMessage && parsed.hasCompletion
     return {
       round: detail.round,
-      ok: response.ok,
+      ok,
       status: response.status,
       headerMs,
       firstTokenMs: parsed.firstTokenMs,
@@ -123,7 +130,7 @@ async function runOneRound(detail) {
       chars: parsed.text.length,
       usage: parsed.usage,
       content: preview(parsed.text, 240),
-      message: response.ok ? 'ok' : preview(parsed.errorText || `HTTP ${response.status}`),
+      message: ok ? 'ok' : preview(errorMessage || `HTTP ${response.status}`),
     }
   } catch (error) {
     return {
@@ -163,6 +170,7 @@ async function readSseResponse(response, wireApi, startedAt) {
   let usage = null
   let errorText = ''
   let firstTokenMs = null
+  let hasCompletion = false
 
   while (true) {
     const { value, done } = await reader.read()
@@ -183,28 +191,34 @@ async function readSseResponse(response, wireApi, startedAt) {
         text += delta
       }
       usage = normalizeUsagePayload(payload?.usage || payload?.response?.usage) || usage
-      if (payload.error) errorText = payload.error.message || JSON.stringify(payload.error)
+      errorText ||= upstreamErrorMessage(payload)
+      if (wireApi === 'responses' && hasCompletionPayload(payload, wireApi)) hasCompletion = true
+      if (wireApi !== 'responses' && Array.isArray(payload.choices) && payload.choices.length > 0) hasCompletion = true
     }
   }
 
   if (buffer) {
     const payload = parseJson(buffer.replace(/^data:\s*/, ''))
     usage = normalizeUsagePayload(payload?.usage || payload?.response?.usage) || usage
+    errorText ||= upstreamErrorMessage(payload)
+    if (wireApi === 'responses' && hasCompletionPayload(payload, wireApi)) hasCompletion = true
+    if (wireApi !== 'responses' && Array.isArray(payload?.choices) && payload.choices.length > 0) hasCompletion = true
   }
 
-  return { text, usage, errorText, firstTokenMs }
+  return { text, usage, errorText, firstTokenMs, hasCompletion: hasCompletion || Boolean(text) }
 }
 
 async function readJsonResponse(response, wireApi, startedAt) {
   const text = await response.text()
   const payload = parseJson(text)
-  if (!payload) return { text: '', usage: null, errorText: text, firstTokenMs: null }
+  if (!payload) return { text: '', usage: null, errorText: text, firstTokenMs: null, hasCompletion: false }
   const content = extractResponseText(payload, wireApi)
   return {
     text: content,
     usage: normalizeUsagePayload(payload?.usage || payload?.response?.usage),
-    errorText: payload?.error?.message || '',
+    errorText: upstreamErrorMessage(payload) || '',
     firstTokenMs: content ? Date.now() - startedAt : null,
+    hasCompletion: hasCompletionPayload(payload, wireApi),
   }
 }
 

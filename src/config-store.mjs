@@ -120,7 +120,9 @@ export class ConfigStore {
       })
     }
 
-    this.config = normalizeConfig(payload)
+    const nextConfig = normalizeConfig(payload)
+    assertUniqueRouteModels(nextConfig.routes)
+    this.config = nextConfig
     syncRoutesWithProviders(this.config)
     this.touch()
     this.persist()
@@ -233,6 +235,8 @@ export class ConfigStore {
       ...input,
     }, this.config.providers)
 
+    assertUniqueRouteModel(this.config.routes, route.virtualModel)
+
     this.config.routes.push(route)
     syncRoutesWithProviders(this.config)
     this.touch()
@@ -246,6 +250,7 @@ export class ConfigStore {
 
     const existing = this.config.routes[index]
     const route = normalizeRoute({ ...existing, ...input, id: existing.id }, this.config.providers)
+    assertUniqueRouteModel(this.config.routes, route.virtualModel, existing.id)
     this.config.routes[index] = route
     syncRoutesWithProviders(this.config)
     this.touch()
@@ -323,7 +328,7 @@ export function publicProvider(provider) {
     apiKeySet: Boolean(credential.apiKey),
     apiKeyMasked: maskSecret(credential.apiKey),
   }))
-  const active = provider.credentials.find((credential) => credential.id === provider.activeCredentialId)
+  const active = resolveActiveCredential(provider)
   clone.activeCredentialLabel = active?.label || ''
   clone.apiKeySet = Boolean(resolveActiveKey(provider))
   clone.apiKeyMasked = maskSecret(resolveActiveKey(provider))
@@ -383,8 +388,12 @@ export function resolveActiveKey(provider) {
   const active =
     credentials.find((credential) => credential.id === provider.activeCredentialId && credential.enabled) ||
     credentials.find((credential) => credential.enabled) ||
-    credentials[0]
-  return active?.apiKey || provider.apiKey || ''
+    null
+  if (active) return active.apiKey || ''
+  // A legacy provider may have no credentials array at all. Once credentials
+  // exist, all-disabled means intentionally unavailable and must not fall back
+  // to a disabled credential or a stale provider.apiKey value.
+  return credentials.length === 0 && typeof provider.apiKey === 'string' ? provider.apiKey : ''
 }
 
 export function resolveActiveCredential(provider) {
@@ -392,7 +401,6 @@ export function resolveActiveCredential(provider) {
   return (
     credentials.find((credential) => credential.id === provider.activeCredentialId && credential.enabled) ||
     credentials.find((credential) => credential.enabled) ||
-    credentials[0] ||
     null
   )
 }
@@ -413,7 +421,7 @@ function normalizeConfig(value) {
 }
 
 function normalizeService(input) {
-  const listenPort = toPositiveInteger(input.listenPort, DEFAULT_CONFIG.service.listenPort)
+  const listenPort = clampInteger(input.listenPort, 1, 65535, DEFAULT_CONFIG.service.listenPort)
   const requestTimeoutMs = toPositiveInteger(input.requestTimeoutMs, DEFAULT_CONFIG.service.requestTimeoutMs)
   const providerTestTimeoutMs = clampInteger(
     input.providerTestTimeoutMs,
@@ -575,7 +583,7 @@ function selectActiveCredentialId(credentials, preferredId = '') {
   const preferred = credentials.find((credential) => credential.id === preferredId && credential.enabled)
   if (preferred) return preferred.id
   const enabled = credentials.find((credential) => credential.enabled)
-  return enabled?.id || credentials[0]?.id || ''
+  return enabled?.id || ''
 }
 
 function normalizeRoute(input, providers) {
@@ -617,6 +625,22 @@ function normalizeTarget(input, index) {
     providerId,
     model,
     priority: toNonNegativeInteger(input.priority, index),
+  }
+}
+
+function assertUniqueRouteModels(routes) {
+  const seen = new Set()
+  for (const route of routes) {
+    if (seen.has(route.virtualModel)) {
+      throw new HttpError(409, 'duplicate_route_model', `A route for virtual model "${route.virtualModel}" already exists.`)
+    }
+    seen.add(route.virtualModel)
+  }
+}
+
+function assertUniqueRouteModel(routes, virtualModel, exceptRouteId = '') {
+  if (routes.some((route) => route.id !== exceptRouteId && route.virtualModel === virtualModel)) {
+    throw new HttpError(409, 'duplicate_route_model', `A route for virtual model "${virtualModel}" already exists.`)
   }
 }
 

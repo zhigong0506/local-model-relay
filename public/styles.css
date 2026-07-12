@@ -2438,3 +2438,347 @@ dialog::backdrop {
     display: none;
   }
 }
+
+/* Theme and compact share-chart composition. */
+:root {
+  --chart-grid: rgba(104, 117, 128, 0.16);
+}
+
+html[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #111719;
+  --ink: #eef4f3;
+  --muted: #9aa9ac;
+  --line: #2c3a3d;
+  --line-strong: #405155;
+  --panel: #192124;
+  --panel-soft: #202a2d;
+  --accent: #45c5b2;
+  --accent-dark: #7cddcf;
+  --accent-weak: #193b37;
+  --info: #8ba4ff;
+  --warn: #e0aa51;
+  --danger: #f17a84;
+  --ok: #68ce91;
+  --chart-grid: rgba(154, 169, 172, 0.15);
+  --shadow-sm: 0 2px 12px rgba(0, 0, 0, 0.18);
+  --shadow: 0 12px 34px rgba(0, 0, 0, 0.24);
+  --shadow-lg: 0 24px 70px rgba(0, 0, 0, 0.46);
+}
+
+html,
+body,
+.topbar,
+.side,
+.panel,
+.panel-head,
+.dashboard-body,
+.status-band > div,
+.stat-card,
+.chart-card,
+.usage-row,
+.log-item,
+dialog,
+input,
+select,
+textarea {
+  transition:
+    color 180ms ease,
+    background-color 180ms ease,
+    border-color 180ms ease,
+    box-shadow 180ms ease;
+}
+
+#themeToggleBtn {
+  position: relative;
+}
+
+#themeToggleBtn::after {
+  content: "";
+  position: absolute;
+  right: 4px;
+  bottom: 4px;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--accent);
+  opacity: 0;
+  transform: scale(0.6);
+  transition: 160ms ease;
+}
+
+html:not([data-theme-mode="system"]) #themeToggleBtn::after {
+  opacity: 1;
+  transform: scale(1);
+}
+
+.share-chart-layout {
+  display: grid;
+  grid-template-columns: minmax(190px, 226px) minmax(0, 1fr);
+  gap: 20px;
+  align-items: center;
+  min-height: 228px;
+}
+
+.share-chart-plot {
+  position: relative;
+  width: 100%;
+  max-width: 226px;
+  aspect-ratio: 1;
+  justify-self: center;
+}
+
+.share-chart-plot canvas {
+  width: 100% !important;
+  height: 100% !important;
+}
+
+.share-chart-legend {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  align-content: center;
+}
+
+.share-legend-item {
+  display: grid;
+  grid-template-columns: 7px minmax(0, 1fr) auto;
+  grid-template-areas:
+    "swatch label percent"
+    "swatch value value";
+  column-gap: 7px;
+  align-items: center;
+  min-width: 0;
+  padding: 3px 5px;
+  border-radius: 7px;
+  transition: background-color 150ms ease;
+}
+
+.share-legend-item:hover {
+  background: var(--panel-soft);
+}
+
+.share-legend-swatch {
+  grid-area: swatch;
+  width: 7px;
+  height: 20px;
+  border-radius: 999px;
+  background: var(--swatch);
+}
+
+.share-legend-label {
+  grid-area: label;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 11px;
+  line-height: 1.18;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.share-legend-item strong {
+  grid-area: percent;
+  color: var(--ink);
+  font-family: "LXGW WenKai Mono Local", "Cascadia Mono", monospace;
+  font-size: 10.5px;
+  font-weight: 650;
+}
+
+.share-legend-item small {
+  grid-area: value;
+  color: var(--muted);
+  font-family: "LXGW WenKai Mono Local", "Cascadia Mono", monospace;
+  font-size: 9px;
+  line-height: 1.1;
+}
+
+.share-legend-empty {
+  display: grid;
+  min-height: 96px;
+  place-items: center;
+  border: 1px dashed var(--line-strong);
+  border-radius: 11px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.usage-chart-grid .chart-card {
+  min-height: 282px;
+}
+
+html[data-theme="dark"] .topbar {
+  border-color: rgba(64, 81, 85, 0.82);
+  background: rgba(20, 28, 30, 0.9);
+  box-shadow: 0 4px 22px rgba(0, 0, 0, 0.24);
+}
+
+html[data-theme="dark"] .side {
+  background: rgba(25, 33, 36, 0.94);
+}
+
+html[data-theme="dark"] .panel-head,
+html[data-theme="dark"] .speed-test-form,
+html[data-theme="dark"] .speed-result-card,
+html[data-theme="dark"] .model-picker-list,
+html[data-theme="dark"] .usage-list,
+html[data-theme="dark"] .usage-row,
+html[data-theme="dark"] .log-list,
+html[data-theme="dark"] .log-item,
+html[data-theme="dark"] .usage-range-menu,
+html[data-theme="dark"] .usage-range-button,
+html[data-theme="dark"] .row-actions button,
+html[data-theme="dark"] .real-test-result pre,
+html[data-theme="dark"] .mini-record,
+html[data-theme="dark"] .speed-result-row {
+  border-color: var(--line);
+  background: var(--panel);
+  color: var(--ink);
+}
+
+html[data-theme="dark"] .dashboard-body,
+html[data-theme="dark"] .record-filters,
+html[data-theme="dark"] .routing-bar,
+html[data-theme="dark"] .onboarding,
+html[data-theme="dark"] .outbound-card,
+html[data-theme="dark"] .provider-proxy-card,
+html[data-theme="dark"] .credential-row,
+html[data-theme="dark"] .target-row,
+html[data-theme="dark"] .real-test-result,
+html[data-theme="dark"] .usage-summary > div,
+html[data-theme="dark"] .usage-range-toolbar,
+html[data-theme="dark"] .speed-summary > div,
+html[data-theme="dark"] .pager,
+html[data-theme="dark"] th {
+  border-color: var(--line);
+  background: var(--panel-soft);
+  color: var(--muted);
+}
+
+html[data-theme="dark"] input,
+html[data-theme="dark"] select,
+html[data-theme="dark"] textarea {
+  border-color: var(--line-strong);
+  background: #151d20;
+  color: var(--ink);
+}
+
+html[data-theme="dark"] input:focus,
+html[data-theme="dark"] select:focus,
+html[data-theme="dark"] textarea:focus {
+  background: #182225;
+}
+
+html[data-theme="dark"] tbody tr:hover,
+html[data-theme="dark"] .usage-row:hover,
+html[data-theme="dark"] .log-item:hover,
+html[data-theme="dark"] .mini-record:hover {
+  background: #202d2f;
+}
+
+html[data-theme="dark"] .ghost {
+  border-color: var(--line);
+  background: var(--panel);
+  color: var(--ink);
+}
+
+html[data-theme="dark"] .danger {
+  border-color: rgba(241, 122, 132, 0.35);
+  background: rgba(241, 122, 132, 0.11);
+}
+
+html[data-theme="dark"] .usage-range-shortcuts button {
+  color: var(--muted);
+}
+
+html[data-theme="dark"] .usage-range-shortcuts button:hover,
+html[data-theme="dark"] .usage-range-shortcuts button.active {
+  background: var(--accent-weak);
+  color: var(--accent-dark);
+}
+
+html[data-theme="dark"] .pill {
+  background: #283438;
+  color: #b7c4c6;
+}
+
+html[data-theme="dark"] .pill.ok {
+  background: #173b2b;
+  color: #79dba0;
+}
+
+html[data-theme="dark"] .pill.warn {
+  background: #46351d;
+  color: #efbd67;
+}
+
+html[data-theme="dark"] .pill.info {
+  background: #293455;
+  color: #a7b8ff;
+}
+
+@media (max-width: 760px) {
+  .share-chart-layout {
+    grid-template-columns: 1fr;
+    gap: 12px;
+  }
+
+  .share-chart-plot {
+    max-width: 196px;
+  }
+
+  .share-chart-legend {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+.log-diagnostics {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 5px;
+  margin-top: -3px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--warn);
+  border-radius: 8px;
+  background: var(--panel-soft);
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.log-diagnostic {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+
+.log-diagnostic strong {
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.log-diagnostic span,
+.log-diagnostic small,
+.log-diagnostic-more {
+  overflow-wrap: anywhere;
+}
+
+.log-diagnostic small,
+.log-diagnostic-more {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+html[data-theme="dark"] .log-diagnostics {
+  border-color: var(--line);
+  border-left-color: #d89a46;
+  background: #202b2e;
+}
+
+@media (max-width: 900px) {
+  .log-item {
+    grid-template-columns: 1fr 1fr;
+  }
+}

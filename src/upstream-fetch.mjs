@@ -82,6 +82,17 @@ function httpsProxyFetch(target, proxyUrl, init = {}) {
   const proxyHeaders = proxyAuthorizationHeaders(proxyUrl)
 
   return new Promise((resolve, reject) => {
+    let settled = false
+    const resolveOnce = (value) => {
+      if (settled) return
+      settled = true
+      resolve(value)
+    }
+    const rejectOnce = (error) => {
+      if (settled) return
+      settled = true
+      reject(error)
+    }
     const connect = client.request({
       protocol: proxyUrl.protocol,
       hostname: proxyUrl.hostname,
@@ -97,8 +108,9 @@ function httpsProxyFetch(target, proxyUrl, init = {}) {
 
     connect.once('connect', (response, socket) => {
       if ((response.statusCode || 0) < 200 || (response.statusCode || 0) >= 300) {
+        protectSocketErrors(socket)
         socket.destroy()
-        reject(new Error(`Proxy CONNECT failed with HTTP ${response.statusCode || 0}`))
+        rejectOnce(new Error(`Proxy CONNECT failed with HTTP ${response.statusCode || 0}`))
         return
       }
 
@@ -106,7 +118,8 @@ function httpsProxyFetch(target, proxyUrl, init = {}) {
         socket,
         servername: target.hostname,
       })
-      secureSocket.once('error', reject)
+      secureSocket.on('error', rejectOnce)
+      secureSocket.once('close', () => secureSocket.off('error', rejectOnce))
 
       const headers = toNodeHeaders(init.headers)
       if (!hasHeader(headers, 'accept-encoding')) {
@@ -120,15 +133,14 @@ function httpsProxyFetch(target, proxyUrl, init = {}) {
         agent: false,
         signal: init.signal,
       }, (message) => {
-        secureSocket.off('error', reject)
-        resolveResponse(message, resolve)
+        resolveResponse(message, resolveOnce)
       })
 
-      request.on('error', reject)
+      request.on('error', rejectOnce)
       endRequest(request, init.body)
     })
 
-    connect.once('error', reject)
+    connect.on('error', rejectOnce)
     connect.end()
   })
 }
@@ -182,6 +194,15 @@ function endRequest(request, body) {
     request.end(body)
   } else {
     request.end()
+  }
+}
+
+function protectSocketErrors(socket) {
+  if (!socket || typeof socket.on !== 'function') return
+  const ignoreError = () => {}
+  socket.on('error', ignoreError)
+  if (typeof socket.once === 'function' && typeof socket.off === 'function') {
+    socket.once('close', () => socket.off('error', ignoreError))
   }
 }
 

@@ -1,5 +1,7 @@
 import { resolveActiveCredential, resolveActiveKey } from './config-store.mjs'
 import { getCachedSystemProxy, resolveProviderOutboundProxy } from './outbound-proxy.mjs'
+import { upstreamErrorMessage } from './response-validation.mjs'
+import { describeRoutingSkip, describeUpstreamFailure, redactSecretText } from './upstream-diagnostics.mjs'
 import {
   buildWireBody,
   buildWirePlan,
@@ -30,6 +32,7 @@ const CLIENT_ABORTED_CODE = 'CLIENT_ABORTED'
 const UPSTREAM_STREAM_FAILED_CODE = 'UPSTREAM_STREAM_FAILED'
 const UPSTREAM_STREAM_INCOMPLETE_CODE = 'UPSTREAM_STREAM_INCOMPLETE'
 const UPSTREAM_STREAM_IDLE_CODE = 'UPSTREAM_STREAM_IDLE_TIMEOUT'
+const UPSTREAM_PAYLOAD_FAILED_CODE = 'UPSTREAM_PAYLOAD_FAILED'
 const APPROX_CHARS_PER_TOKEN = 4
 
 export async function handleProxyRequest(req, res, context) {
@@ -97,7 +100,9 @@ export async function handleProxyRequest(req, res, context) {
 
   const virtualModel = typeof body.model === 'string' ? body.model : ''
   const route = findRoute(config, virtualModel)
-  const candidates = buildCandidates(config, route, virtualModel, stateStore)
+  const candidateContext = buildCandidateContext(config, route, virtualModel, stateStore)
+  const candidates = candidateContext.candidates
+  const routingDiagnostics = candidateContext.diagnostics
   const attempts = []
   let lastError = null
 
@@ -111,12 +116,14 @@ export async function handleProxyRequest(req, res, context) {
       attempts: [],
       durationMs: Date.now() - startedAt,
       error: 'No available provider route.',
+      diagnostics: routingDiagnostics,
     })
     return sendJson(res, 503, {
       error: {
         type: 'no_available_provider',
         message: `No available provider route for model "${virtualModel || '(missing)'}".`,
       },
+      diagnostics: routingDiagnostics,
     })
   }
 
@@ -142,15 +149,21 @@ export async function handleProxyRequest(req, res, context) {
       let streamInfo = null
 
       if (shouldRetryStatus(upstreamResponse.status, config.service.retryStatusCodes)) {
-        const message = await readPreview(upstreamResponse, upstream.abort, candidate.provider.timeoutMs)
+        const message = redactSecretText(
+          await readPreview(upstreamResponse, upstream.abort, candidate.provider.timeoutMs),
+          resolveActiveKey(candidate.provider),
+        )
+        const diagnostic = describeUpstreamFailure(upstreamResponse.status, message)
         attempt.error = message
+        attempt.outcome = 'upstream_error'
+        attempt.diagnostic = diagnostic
         stateStore.markFailure(candidate.provider.id, {
           status: upstreamResponse.status,
           message,
           latencyMs,
           cooldownSeconds: candidate.provider.cooldownSeconds,
         })
-        lastError = { status: upstreamResponse.status, message }
+        lastError = { status: upstreamResponse.status, message, diagnostic }
         continue
       }
 
@@ -165,20 +178,39 @@ export async function handleProxyRequest(req, res, context) {
         streamInfo = piped.stream
       } catch (streamError) {
         upstream.abort()
-        const message = streamError instanceof Error ? streamError.message : String(streamError)
+        const message = redactSecretText(
+          streamError instanceof Error ? streamError.message : String(streamError),
+          resolveActiveKey(candidate.provider),
+        )
         capturedUsage = capturedUsage || streamError?.usage || null
         streamInfo = streamInfo || streamError?.stream || null
         if (streamError?.code === UPSTREAM_STREAM_FAILED_CODE) attempt.outcome = 'upstream_stream_failed'
         if (streamError?.code === UPSTREAM_STREAM_INCOMPLETE_CODE) attempt.outcome = 'upstream_stream_incomplete'
         if (streamError?.code === UPSTREAM_STREAM_IDLE_CODE) attempt.outcome = 'upstream_stream_idle_timeout'
+        if (streamError?.code === UPSTREAM_PAYLOAD_FAILED_CODE) attempt.outcome = 'upstream_payload_failed'
         const outcome = streamError?.code === CLIENT_ABORTED_CODE
           ? classifyClientAbort(streamInfo)
-          : ''
+          : streamError?.code === UPSTREAM_PAYLOAD_FAILED_CODE
+            ? 'upstream_payload_failed'
+            : streamError?.code === UPSTREAM_STREAM_FAILED_CODE
+              ? 'upstream_stream_failed'
+              : streamError?.code === UPSTREAM_STREAM_INCOMPLETE_CODE
+                ? 'upstream_stream_incomplete'
+                : streamError?.code === UPSTREAM_STREAM_IDLE_CODE
+                  ? 'upstream_stream_idle_timeout'
+                  : ''
         const semanticallyComplete = streamError?.code === CLIENT_ABORTED_CODE &&
           ok &&
           outcome !== 'client_disconnected'
         attempt.error = semanticallyComplete ? '' : message
         attempt.outcome = outcome
+        if (!semanticallyComplete && outcome !== 'client_disconnected') {
+          attempt.diagnostic = describeUpstreamFailure(
+            upstreamResponse.status,
+            message,
+            outcome,
+          )
+        }
 
         if (streamError?.code === CLIENT_ABORTED_CODE) {
           if (semanticallyComplete) {
@@ -221,6 +253,7 @@ export async function handleProxyRequest(req, res, context) {
             outcome,
             stream: streamInfo,
             usage: capturedUsage,
+            diagnostics: requestDiagnostics(routingDiagnostics, attempts),
           })
           return
         }
@@ -245,6 +278,8 @@ export async function handleProxyRequest(req, res, context) {
           durationMs: Date.now() - startedAt,
           error: message,
           usage: capturedUsage,
+          outcome,
+          diagnostics: requestDiagnostics(routingDiagnostics, attempts),
         })
 
         if (res.headersSent || res.writableEnded || res.destroyed) {
@@ -253,7 +288,11 @@ export async function handleProxyRequest(req, res, context) {
         }
 
         clearResponseHeaders(res)
-        lastError = { status: 0, message }
+        lastError = {
+          status: upstreamResponse.status >= 400 ? upstreamResponse.status : 502,
+          message,
+          diagnostic: attempt.diagnostic,
+        }
         continue
       }
 
@@ -270,9 +309,13 @@ export async function handleProxyRequest(req, res, context) {
           })
         }
       } else {
+        const message = `HTTP ${upstreamResponse.status}`
+        attempt.error = message
+        attempt.outcome = 'upstream_error'
+        attempt.diagnostic = describeUpstreamFailure(upstreamResponse.status, message)
         stateStore.markFailure(candidate.provider.id, {
           status: upstreamResponse.status,
-          message: `HTTP ${upstreamResponse.status}`,
+          message,
           latencyMs,
           cooldownSeconds: 0,
         })
@@ -291,21 +334,29 @@ export async function handleProxyRequest(req, res, context) {
         outcome: ok ? 'completed' : 'upstream_error',
         stream: streamInfo,
         usage: ok ? capturedUsage : null,
+        diagnostics: requestDiagnostics(routingDiagnostics, attempts),
       })
       return
     } catch (error) {
       const latencyMs = Date.now() - attempt.startedAt
-      const message = error instanceof Error ? error.message : String(error)
+      const message = redactSecretText(
+        error instanceof Error ? error.message : String(error),
+        resolveActiveKey(candidate.provider),
+      )
       attempt.status = 0
       attempt.latencyMs = latencyMs
       attempt.error = message
+      attempt.outcome = 'upstream_error'
+      attempt.diagnostic = describeUpstreamFailure(0, message, '', {
+        timedOut: error?.name === 'AbortError',
+      })
       stateStore.markFailure(candidate.provider.id, {
         status: 0,
         message,
         latencyMs,
         cooldownSeconds: candidate.provider.cooldownSeconds,
       })
-      lastError = { status: 0, message }
+      lastError = { status: 0, message, diagnostic: attempt.diagnostic }
     }
   }
 
@@ -318,6 +369,8 @@ export async function handleProxyRequest(req, res, context) {
     attempts: attempts.map(publicAttempt),
     durationMs: Date.now() - startedAt,
     error: lastError?.message || 'Every provider failed.',
+    outcome: 'all_providers_failed',
+    diagnostics: requestDiagnostics(routingDiagnostics, attempts),
   })
 
   return sendJson(res, lastError?.status && lastError.status >= 400 ? lastError.status : 502, {
@@ -326,6 +379,7 @@ export async function handleProxyRequest(req, res, context) {
       message: lastError?.message || 'Every provider failed.',
     },
     attempts: attempts.map(publicAttempt),
+    diagnostics: requestDiagnostics(routingDiagnostics, attempts),
   })
 }
 
@@ -339,32 +393,55 @@ export function findRoute(config, virtualModel) {
 }
 
 export function buildCandidates(config, route, virtualModel, stateStore) {
-  const enabledProviders = new Map(
-    config.providers
-      .filter((provider) => provider.enabled)
-      .sort((a, b) => a.priority - b.priority || a.name.localeCompare(b.name))
-      .map((provider) => [provider.id, provider]),
-  )
+  return buildCandidateContext(config, route, virtualModel, stateStore).candidates
+}
 
+function buildCandidateContext(config, route, virtualModel, stateStore) {
+  const providers = [...config.providers].sort((a, b) => a.priority - b.priority || a.name.localeCompare(b.name))
+  const providersById = new Map(providers.map((provider) => [provider.id, provider]))
   const now = Date.now()
   const candidates = []
+  const diagnostics = []
 
   if (route) {
     for (const target of [...route.targets].sort((a, b) => a.priority - b.priority)) {
-      const provider = enabledProviders.get(target.providerId)
-      if (!provider || stateStore.isCooling(provider.id, now)) continue
+      const provider = providersById.get(target.providerId)
+      if (!provider) continue
+
+      const reason = providerSkipReason(provider, stateStore, now)
+      if (reason) {
+        diagnostics.push(describeRoutingSkip(provider, reason, target.model))
+        continue
+      }
       candidates.push({ provider, model: target.model })
     }
-    return rotateToStart(candidates, stateStore.getStartProviderId?.())
+    return {
+      candidates: rotateToStart(candidates, stateStore.getStartProviderId?.()),
+      diagnostics,
+    }
   }
 
-  for (const provider of enabledProviders.values()) {
-    if (stateStore.isCooling(provider.id, now)) continue
-    if (provider.models.length > 0 && !provider.models.includes(virtualModel)) continue
+  for (const provider of providers) {
+    const reason = providerSkipReason(provider, stateStore, now, virtualModel)
+    if (reason) {
+      diagnostics.push(describeRoutingSkip(provider, reason, virtualModel))
+      continue
+    }
     candidates.push({ provider, model: virtualModel })
   }
 
-  return rotateToStart(candidates, stateStore.getStartProviderId?.())
+  return {
+    candidates: rotateToStart(candidates, stateStore.getStartProviderId?.()),
+    diagnostics,
+  }
+}
+
+function providerSkipReason(provider, stateStore, now, virtualModel = null) {
+  if (!provider.enabled) return 'provider_disabled'
+  if (provider.authMode !== 'none' && !resolveActiveKey(provider)) return 'no_enabled_key'
+  if (stateStore.isCooling(provider.id, now)) return 'cooldown'
+  if (virtualModel !== null && provider.models.length > 0 && !provider.models.includes(virtualModel)) return 'unsupported_model'
+  return ''
 }
 
 function rotateToStart(candidates, startProviderId = '') {
@@ -418,11 +495,11 @@ function buildHeaders(source, provider) {
 
   headers.set('content-type', 'application/json')
 
-  if (provider.authMode === 'authorization' || provider.authMode === 'both') {
+  if (apiKey && (provider.authMode === 'authorization' || provider.authMode === 'both')) {
     headers.set('authorization', `Bearer ${apiKey}`)
   }
 
-  if (provider.authMode === 'x-api-key' || provider.authMode === 'both') {
+  if (apiKey && (provider.authMode === 'x-api-key' || provider.authMode === 'both')) {
     headers.set('x-api-key', apiKey)
   }
 
@@ -457,6 +534,12 @@ async function readPreview(response, abortUpstream, timeoutMs = 30000) {
 }
 
 async function pipeUpstreamResponse(upstreamResponse, res, candidate, attemptsCount, abortUpstream, options = {}) {
+  const contentType = upstreamResponse.headers.get('content-type') || ''
+  if (isJsonContentType(contentType)) {
+    const errorMessage = await inspectJsonUpstreamError(upstreamResponse)
+    if (errorMessage) throw makeUpstreamPayloadError(errorMessage, upstreamResponse.status)
+  }
+
   res.statusCode = upstreamResponse.status
   res.statusMessage = upstreamResponse.statusText
 
@@ -717,6 +800,21 @@ function streamFailureMessage(payload, type) {
   return preview(String(message || type || 'Upstream stream reported a failure.'))
 }
 
+function isJsonContentType(contentType) {
+  return contentType.includes('application/json') || contentType.includes('+json')
+}
+
+async function inspectJsonUpstreamError(response) {
+  if (typeof response.clone !== 'function') return ''
+  try {
+    const text = await response.clone().text()
+    if (!text.trim()) return ''
+    return upstreamErrorMessage(JSON.parse(text))
+  } catch {
+    return ''
+  }
+}
+
 function createUsageCollector(response, enabled, requestBody = {}) {
   const collector = {
     usage: null,
@@ -941,6 +1039,13 @@ function makeUpstreamStreamIdleError(timeoutMs, stream = null, usage = null) {
   return error
 }
 
+function makeUpstreamPayloadError(message, status = 0) {
+  const error = new Error(`Upstream returned an error payload: ${message}`)
+  error.code = UPSTREAM_PAYLOAD_FAILED_CODE
+  error.upstreamStatus = status
+  return error
+}
+
 function listModels(config) {
   const routeModels = config.routes.filter((route) => route.enabled).map((route) => route.virtualModel)
   const providerModels = config.providers.flatMap((provider) => provider.models)
@@ -975,10 +1080,26 @@ function publicAttempt(attempt) {
     latencyMs: attempt.latencyMs ?? null,
     error: attempt.error ? preview(attempt.error) : null,
     outcome: attempt.outcome || '',
+    diagnostic: attempt.diagnostic || null,
     reconnectFailureCount: attempt.reconnectFailureCount || 0,
     reconnectFailureThreshold: attempt.reconnectFailureThreshold || 0,
     failoverArmed: Boolean(attempt.failoverArmed),
   }
+}
+
+function requestDiagnostics(routingDiagnostics = [], attempts = []) {
+  const attemptDiagnostics = attempts.map((attempt, index) => {
+    if (!attempt.diagnostic) return null
+    return {
+      ...attempt.diagnostic,
+      providerId: attempt.providerId,
+      providerName: attempt.providerName,
+      model: attempt.model,
+      attempt: index + 1,
+    }
+  }).filter(Boolean)
+
+  return [...routingDiagnostics, ...attemptDiagnostics]
 }
 
 function preview(value, maxLength = 500) {

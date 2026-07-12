@@ -5,6 +5,16 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Local Model Relay</title>
     <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
+    <script>
+      (() => {
+        const key = 'local-model-relay-theme'
+        const saved = localStorage.getItem(key)
+        const mode = ['system', 'light', 'dark'].includes(saved) ? saved : 'system'
+        const dark = mode === 'dark' || (mode === 'system' && matchMedia('(prefers-color-scheme: dark)').matches)
+        document.documentElement.dataset.themeMode = mode
+        document.documentElement.dataset.theme = dark ? 'dark' : 'light'
+      })()
+    </script>
     <link rel="stylesheet" href="/assets/styles.css">
   </head>
   <body>
@@ -14,6 +24,7 @@
         <h1>本地模型中转控制台</h1>
       </div>
       <div class="top-actions">
+        <button id="themeToggleBtn" class="icon-btn" type="button" title="主题：跟随系统" aria-label="主题：跟随系统"><span id="themeToggleIcon" aria-hidden="true">◐</span></button>
         <button id="copyBaseUrlBtn" class="icon-btn" type="button" title="复制本地接口地址" aria-label="复制本地接口地址">⧉</button>
         <button id="refreshBtn" class="icon-btn" type="button" title="刷新状态" aria-label="刷新状态">↻</button>
         <label class="switch" title="开启或暂停 /v1 本地接口">
@@ -122,11 +133,14 @@
                 <canvas id="tokenTrendChart" height="118"></canvas>
               </div>
               <div class="chart-card">
-                <div class="chart-head">
-                  <h3>模型分布</h3>
-                  <span>Top 8</span>
-                </div>
-                <canvas id="modelShareChart" height="220"></canvas>
+              <div class="chart-head">
+                <h3>模型分布</h3>
+                <span>Top 8</span>
+              </div>
+              <div class="share-chart-layout">
+                <div class="share-chart-plot"><canvas id="modelShareChart"></canvas></div>
+                <div id="modelShareLegend" class="share-chart-legend" aria-label="模型 Token 占比图例"></div>
+              </div>
               </div>
               <div class="chart-card recent-card">
                 <div class="chart-head">
@@ -344,6 +358,7 @@
             <label>
               <span>最大尝试次数</span>
               <input name="maxAttempts" type="number" min="1">
+              <small class="field-hint">普通 HTTP 失败会按此上限继续换线；建议不低于当前可用线路数。</small>
             </label>
             <label>
               <span>默认冷却秒数</span>
@@ -492,14 +507,20 @@
                 <h3>模型 Token 占比</h3>
                 <span id="usageModelShareRange">近 24 小时 · Top 8</span>
               </div>
-              <canvas id="usageModelShareChart" height="210"></canvas>
+              <div class="share-chart-layout">
+                <div class="share-chart-plot"><canvas id="usageModelShareChart"></canvas></div>
+                <div id="usageModelShareLegend" class="share-chart-legend" aria-label="模型 Token 占比图例"></div>
+              </div>
             </div>
             <div class="chart-card">
               <div class="chart-head">
                 <h3>线路 Token 占比</h3>
                 <span id="usageProviderShareRange">近 24 小时 · Top 8</span>
               </div>
-              <canvas id="usageProviderShareChart" height="210"></canvas>
+              <div class="share-chart-layout">
+                <div class="share-chart-plot"><canvas id="usageProviderShareChart"></canvas></div>
+                <div id="usageProviderShareLegend" class="share-chart-legend" aria-label="线路 Token 占比图例"></div>
+              </div>
             </div>
           </section>
           <section class="usage-window-block">

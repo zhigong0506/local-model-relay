@@ -322,7 +322,13 @@ function normalizeState(value) {
     upstreamUsage: normalizeUpstreamUsage(value?.upstreamUsage),
     startedAt: typeof value?.startedAt === 'string' ? value.startedAt : null,
   }
-  if (Number(rawUsage?.schemaVersion || 0) < USAGE_SCHEMA_VERSION) {
+  const hasUsageDimensions = [
+    rawUsage?.providerHourly,
+    rawUsage?.modelHourly,
+    rawUsage?.dailyByProvider,
+    rawUsage?.dailyByModel,
+  ].every((dimension) => dimension && typeof dimension === 'object' && !Array.isArray(dimension))
+  if (Number(rawUsage?.schemaVersion || 0) < USAGE_SCHEMA_VERSION || !hasUsageDimensions) {
     backfillUsageDimensions(state.usage, requestLog)
   }
 
@@ -357,6 +363,12 @@ function backfillUsageDimensions(usageState, requestLog) {
       usageState.modelHourly[modelKey],
       hourKey,
       log.usage,
+    )
+    usageState.providerHourly[providerKey] = addHourlyDimension(
+      usageState.providerHourly[providerKey],
+      hourKey,
+      log.usage,
+      log.durationMs,
     )
     usageState.dailyByModel[modelKey] = addDailyDimension(
       usageState.dailyByModel[modelKey],

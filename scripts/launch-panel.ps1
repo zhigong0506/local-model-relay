@@ -1,6 +1,15 @@
 $ErrorActionPreference = 'Stop'
 $ProjectDir = Split-Path -Parent $PSScriptRoot
 $Port = 25818
+$ConfigPath = Join-Path $ProjectDir 'data\config.json'
+if (Test-Path -LiteralPath $ConfigPath) {
+    try {
+        $configuredPort = [int]((Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json).service.listenPort)
+        if ($configuredPort -ge 1 -and $configuredPort -le 65535) { $Port = $configuredPort }
+    } catch {
+        # Fall back to the default port when the config is missing or malformed.
+    }
+}
 $Url = "http://127.0.0.1:$Port/admin"
 $HealthUrl = "http://127.0.0.1:$Port/health"
 

@@ -37,9 +37,9 @@ try {
   assert.equal(explicitZero.cachedTokens, 0)
   assert.equal(explicitZero.cachedTokensReported, true)
 
-  // Keep the sample away from midnight so the assertion is stable on UTC CI
-  // runners as well as on the user's local timezone.
-  const oldTimestamp = Date.parse('2026-07-10T12:30:00+08:00')
+  // Construct timestamps in the runtime's local timezone because production
+  // daily dimensions intentionally use local calendar dates.
+  const oldTimestamp = new Date(2026, 6, 10, 12, 30).getTime()
   writeFileSync(stateFile, JSON.stringify({
     version: 1,
     requestLog: [{
@@ -72,10 +72,11 @@ try {
   assert.equal(state.usage.schemaVersion, 2)
   assert.equal(state.usage.dimensionStartAt, oldTimestamp)
   assert.equal(state.usage.modelHourly['upstream-test'][String(Math.floor(oldTimestamp / 3600000))].totalTokens, 120)
+  assert.equal(state.usage.providerHourly['历史线路'][String(Math.floor(oldTimestamp / 3600000))].latencySum, 250)
   assert.equal(state.usage.dailyByModel['upstream-test']['2026-07-10'].cachedTokens, 40)
   assert.equal(state.usage.dailyByProvider['历史线路']['2026-07-10'].latencySum, 250)
 
-  const nextTimestamp = Date.parse('2026-07-10T13:15:00+08:00')
+  const nextTimestamp = new Date(2026, 6, 10, 13, 15).getTime()
   store.recordUsage('provider-id', 'upstream-test', {
     inputTokens: 80,
     outputTokens: 10,

@@ -1,13 +1,14 @@
 import { createServer } from 'node:http'
 import { createReadStream, existsSync } from 'node:fs'
 import { extname, isAbsolute, join, relative, resolve } from 'node:path'
-import { ConfigStore, HttpError } from './config-store.mjs'
+import { ConfigStore, HttpError, resolveActiveCredential, resolveActiveKey } from './config-store.mjs'
 import { getCachedSystemProxy, getOutboundRuntime } from './outbound-proxy.mjs'
 import { StateStore } from './state-store.mjs'
 import { handleProxyRequest } from './proxy.mjs'
 import { publicDir, rootDir } from './paths.mjs'
 import { previewRoute, realTestProvider, syncProviderCredentialUsage, testProvider } from './provider-test.mjs'
 import { fetchSpeedTestModels, runSpeedTest } from './speed-test.mjs'
+import { describeRoutingSkip, describeUpstreamFailure, redactSecretText } from './upstream-diagnostics.mjs'
 
 const configStore = new ConfigStore()
 const stateStore = new StateStore()
@@ -34,9 +35,9 @@ const server = createServer(async (req, res) => {
 server.on('error', (error) => {
   const code = error && typeof error === 'object' ? error.code : ''
   if (code === 'EADDRINUSE') {
-    relayError(`failed to start: ${runtimeConfig.service.listenHost}:${runtimeConfig.service.listenPort} is already in use.`)
+    relayError(`failed to start: ${runtimeListenHost}:${runtimeListenPort} is already in use.`)
   } else if (code === 'EACCES') {
-    relayError(`failed to start: no permission to listen on ${runtimeConfig.service.listenHost}:${runtimeConfig.service.listenPort}.`)
+    relayError(`failed to start: no permission to listen on ${runtimeListenHost}:${runtimeListenPort}.`)
   } else {
     relayError(`failed to start: ${error instanceof Error ? error.message : String(error)}`)
   }
@@ -163,7 +164,9 @@ async function routeRequest(req, res) {
     const config = configStore.get()
     const provider = config.providers.find((item) => item.id === providerTestMatch[1])
     if (!provider) throw new HttpError(404, 'provider_not_found', 'Provider not found.')
-    return sendJson(res, 200, await testProvider(provider, null, config.service))
+    const result = await testProvider(provider, null, config.service)
+    recordProviderTestResult(provider, result)
+    return sendJson(res, 200, result)
   }
 
   const providerRealTestMatch = url.pathname.match(/^\/api\/providers\/([^/]+)\/real-test$/)
@@ -315,6 +318,7 @@ function recordRealTestResult(provider, result) {
   if (provider.tags?.includes('tmp-real-test-model')) return
 
   const latencyMs = Number(result.latencyMs) || 0
+  const diagnostic = testDiagnostic(provider, result)
   const config = configStore.get()
   if (result.ok) {
     stateStore.markSuccess(provider.id, { status: result.status || 200, latencyMs })
@@ -327,7 +331,7 @@ function recordRealTestResult(provider, result) {
   } else {
     stateStore.markFailure(provider.id, {
       status: result.status || 0,
-      message: result.message || 'Real test failed.',
+      message: testFailureMessage(provider, result, 'Real test failed.'),
       latencyMs,
       cooldownSeconds: 0,
     })
@@ -353,16 +357,82 @@ function recordRealTestResult(provider, result) {
         model: result.model,
         status: result.status || 0,
         latencyMs,
-        error: result.ok ? null : result.message || 'Real test failed.',
+        error: result.ok ? null : testFailureMessage(provider, result, 'Real test failed.'),
         outcome: result.ok ? 'real_test_success' : 'real_test_failed',
+        diagnostic,
       }],
       durationMs: latencyMs,
       outcome: result.ok ? 'real_test_success' : 'real_test_failed',
-      stream: false,
+      stream: true,
       usage: result.ok ? result.usage : null,
-      error: result.ok ? undefined : result.message || 'Real test failed.',
+      error: result.ok ? undefined : testFailureMessage(provider, result, 'Real test failed.'),
+      diagnostics: diagnostic ? [diagnostic] : [],
     }, config.service.requestLogLimit)
   }
+}
+
+function recordProviderTestResult(provider, result) {
+  const config = configStore.get()
+  if (!config.service.logRequests) return
+
+  const credential = resolveActiveCredential(provider)
+  const latencyMs = Number(result.latencyMs) || 0
+  const diagnostic = testDiagnostic(provider, result)
+  stateStore.addRequestLog({
+    testType: 'provider_test',
+    method: 'TEST',
+    path: '/v1/models',
+    model: result.model || '',
+    routedModel: '',
+    providerId: provider.id,
+    providerName: provider.name,
+    credentialId: credential?.id || '',
+    credentialLabel: credential?.label || '',
+    status: result.status || 0,
+    ok: Boolean(result.ok),
+    attempts: [{
+      providerId: provider.id,
+      providerName: provider.name,
+      credentialId: credential?.id || '',
+      credentialLabel: credential?.label || '',
+      model: result.model || '',
+      status: result.status || 0,
+      latencyMs,
+      error: result.ok ? null : testFailureMessage(provider, result, 'Provider test failed.'),
+      outcome: result.ok ? 'provider_test_success' : 'provider_test_failed',
+      diagnostic,
+    }],
+    durationMs: latencyMs,
+    outcome: result.ok ? 'provider_test_success' : 'provider_test_failed',
+    stream: false,
+    usage: null,
+    error: result.ok ? undefined : testFailureMessage(provider, result, 'Provider test failed.'),
+    diagnostics: diagnostic ? [diagnostic] : [],
+  }, config.service.requestLogLimit)
+}
+
+function testDiagnostic(provider, result) {
+  if (!result || result.ok) return null
+  if (result.reason === 'no_credential') {
+    return describeRoutingSkip(provider, 'no_enabled_key', result.model || '')
+  }
+
+  const diagnostic = describeUpstreamFailure(
+    result.status,
+    testFailureMessage(provider, result, 'Upstream test failed.'),
+    result.reason || 'upstream_error',
+    { timedOut: result.reason === 'local_timeout' },
+  )
+  return {
+    ...diagnostic,
+    providerId: provider.id,
+    providerName: provider.name,
+    model: result.model || '',
+  }
+}
+
+function testFailureMessage(provider, result, fallback) {
+  return redactSecretText(result?.message || fallback, resolveActiveKey(provider))
 }
 
 function relayLog(message) {

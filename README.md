@@ -24,7 +24,10 @@ It is a personal desktop tool, not a multi-user gateway or billing platform.
   reconnect circuit breaking
 - Quick connectivity tests, model-aware real tests, and ad-hoc endpoint speed tests
 - Searchable model pickers for large speed-test and real-test model lists
-- Request records, pagination, date filters, Token charts, and cache-Token diagnostics
+- Actionable request diagnostics for disabled keys, retry skips, common upstream
+  failures, and HTTP 200 error payloads, with masked credential references
+- Request records, pagination, date filters, Token charts, cache-Token diagnostics,
+  system-aware light/dark themes, and compact model/provider share charts
 - Configuration import/export with masked-secret export by default
 - No runtime dependencies, build step, or external database
 
@@ -146,10 +149,12 @@ shortcut.
 npm run test:all
 ```
 
-The suite covers status-code failover, long-task quota exhaustion failover,
-stream failure and idle-stream failover, Codex text/tool compatibility,
-reconnect circuit breaking, sticky routing, proxy behavior, cache fields, usage
-estimates, and real-test model selection.
+The suite covers status-code failover, HTTP 200 error-payload rejection,
+long-task quota exhaustion failover, stream failure and idle-stream failover,
+Codex text/tool compatibility, reconnect circuit breaking, sticky routing,
+proxy behavior, TLS socket-error protection, disabled-key routing, actionable
+diagnostics, cache fields, usage estimates, theme/chart behavior, and real-test
+model selection.
 E2E tests run on random local ports with temporary data directories, so they do
 not alter the user's running providers, routes, logs, or usage totals.
 

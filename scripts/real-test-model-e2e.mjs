@@ -38,6 +38,7 @@ try {
       valid.latencyMs >= 5000 &&
       hitsAfterValidTest === 1 &&
       hits[0]?.body?.model === selectedModel &&
+      hits[0]?.body?.stream === true &&
       unsupported.ok === false &&
       unsupported.skipped === true &&
       unsupported.reason === 'unsupported_model' &&
@@ -103,6 +104,24 @@ function startMockServer() {
     await new Promise((resolve) => setTimeout(resolve, 5200))
 
     res.statusCode = 200
+    if (body.stream) {
+      res.setHeader('content-type', 'text/event-stream; charset=utf-8')
+      res.write(`data: ${JSON.stringify({
+        id: `chatcmpl-${stamp}`,
+        object: 'chat.completion.chunk',
+        model: body.model,
+        choices: [{ index: 0, delta: { role: 'assistant', content: `MODEL_OK:${body.model}` }, finish_reason: null }],
+      })}\n\n`)
+      res.write(`data: ${JSON.stringify({
+        id: `chatcmpl-${stamp}`,
+        object: 'chat.completion.chunk',
+        model: body.model,
+        choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
+      })}\n\n`)
+      res.end('data: [DONE]\n\n')
+      return
+    }
     res.setHeader('content-type', 'application/json; charset=utf-8')
     res.end(JSON.stringify({
       id: `chatcmpl-${stamp}`,

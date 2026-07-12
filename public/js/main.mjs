@@ -19,6 +19,7 @@ const state = {
   modelPickers: {},
   dashboardRange: '7d',
   dashboardGranularity: 'day',
+  themeMode: document.documentElement.dataset.themeMode || 'system',
   recordsFilter: {
     search: '',
     status: 'all',
@@ -40,6 +41,7 @@ const $$ = (selector, root = document) => [...root.querySelectorAll(selector)]
 const formField = (form, name) => form.elements.namedItem(name)
 
 document.addEventListener('DOMContentLoaded', async () => {
+  bindThemeControls()
   bindTabs()
   bindActions()
   await refreshAll()
@@ -123,6 +125,64 @@ function bindActions() {
   $$('.close-dialog').forEach((button) => button.addEventListener('click', () => button.closest('dialog').close()))
   document.addEventListener('click', closeModelPickersOnOutsideClick)
   document.addEventListener('keydown', closeModelPickersOnEscape)
+}
+
+function bindThemeControls() {
+  const button = $('#themeToggleBtn')
+  const systemTheme = window.matchMedia('(prefers-color-scheme: dark)')
+  button.addEventListener('click', () => {
+    const modes = ['system', 'light', 'dark']
+    applyThemeMode(modes[(modes.indexOf(state.themeMode) + 1) % modes.length])
+  })
+  systemTheme.addEventListener('change', () => {
+    if (state.themeMode === 'system') applyThemeMode('system', false)
+  })
+  updateThemeButton()
+  syncChartTheme()
+}
+
+function applyThemeMode(mode, persist = true) {
+  state.themeMode = ['system', 'light', 'dark'].includes(mode) ? mode : 'system'
+  const theme = state.themeMode === 'system'
+    ? (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
+    : state.themeMode
+  document.documentElement.dataset.themeMode = state.themeMode
+  document.documentElement.dataset.theme = theme
+  if (persist) localStorage.setItem('local-model-relay-theme', state.themeMode)
+  updateThemeButton()
+  syncChartTheme()
+}
+
+function updateThemeButton() {
+  const button = $('#themeToggleBtn')
+  if (!button) return
+  const details = {
+    system: { icon: '◐', label: '跟随系统' },
+    light: { icon: '☀', label: '日间模式' },
+    dark: { icon: '☾', label: '夜间模式' },
+  }
+  const current = details[state.themeMode] || details.system
+  $('#themeToggleIcon').textContent = current.icon
+  button.title = `主题：${current.label}（点击切换）`
+  button.setAttribute('aria-label', button.title)
+}
+
+function syncChartTheme() {
+  if (!window.Chart) return
+  const styles = getComputedStyle(document.documentElement)
+  const textColor = styles.getPropertyValue('--muted').trim()
+  const lineColor = styles.getPropertyValue('--chart-grid').trim()
+  Chart.defaults.color = textColor
+  Chart.defaults.borderColor = lineColor
+  Object.values(state.charts).filter(Boolean).forEach((chart) => {
+    if (chart.options.scales) {
+      Object.values(chart.options.scales).forEach((scale) => {
+        scale.ticks = { ...(scale.ticks || {}), color: textColor }
+        scale.grid = { ...(scale.grid || {}), color: lineColor }
+      })
+    }
+    chart.update('none')
+  })
 }
 
 async function refreshAll() {
@@ -387,13 +447,13 @@ function renderProviders() {
       <td>${lastProviderState(entry)}</td>
       <td>
         <div class="row-actions">
-          <button data-action="set-start-provider" data-id="${provider.id}" ${isStartProvider ? 'disabled' : ''}>${isStartProvider ? '当前起点' : '设为起点'}</button>
-          <button data-action="test" data-id="${provider.id}">测试</button>
-          <button data-action="real-test" data-id="${provider.id}">真实测试</button>
-          <button data-action="sync-usage" data-id="${provider.id}">同步扣账</button>
-          <button data-action="toggle-provider" data-id="${provider.id}">${provider.enabled ? '停用' : '启用'}</button>
-          <button data-action="edit-provider" data-id="${provider.id}">编辑</button>
-          <button data-action="delete-provider" data-id="${provider.id}">删除</button>
+          <button data-action="set-start-provider" data-id="${escapeHtml(provider.id)}" ${isStartProvider ? 'disabled' : ''}>${isStartProvider ? '当前起点' : '设为起点'}</button>
+          <button data-action="test" data-id="${escapeHtml(provider.id)}">测试</button>
+          <button data-action="real-test" data-id="${escapeHtml(provider.id)}">真实测试</button>
+          <button data-action="sync-usage" data-id="${escapeHtml(provider.id)}">同步扣账</button>
+          <button data-action="toggle-provider" data-id="${escapeHtml(provider.id)}">${provider.enabled ? '停用' : '启用'}</button>
+          <button data-action="edit-provider" data-id="${escapeHtml(provider.id)}">编辑</button>
+          <button data-action="delete-provider" data-id="${escapeHtml(provider.id)}">删除</button>
         </div>
       </td>
     `
@@ -429,9 +489,9 @@ function renderRoutes() {
       <td>${escapeHtml(route.notes || '-')}</td>
       <td>
         <div class="row-actions">
-          <button data-action="toggle-route" data-id="${route.id}">${route.enabled ? '停用' : '启用'}</button>
-          <button data-action="edit-route" data-id="${route.id}">编辑</button>
-          <button data-action="delete-route" data-id="${route.id}">删除</button>
+          <button data-action="toggle-route" data-id="${escapeHtml(route.id)}">${route.enabled ? '停用' : '启用'}</button>
+          <button data-action="edit-route" data-id="${escapeHtml(route.id)}">编辑</button>
+          <button data-action="delete-route" data-id="${escapeHtml(route.id)}">删除</button>
         </div>
       </td>
     `
@@ -468,6 +528,7 @@ function renderLogs() {
       <div>${logStatusPill(log)}</div>
       <div>${usageMini(log.usage)}</div>
       <div><strong>${log.durationMs ?? '-'} ms</strong><br><small>${escapeHtml(logStatusText(log))}</small></div>
+      ${logDiagnosticsMarkup(log)}
     `
     list.appendChild(item)
   }
@@ -490,8 +551,8 @@ function renderUsage() {
 
   renderUsageWindowRows(rangedUsage.byProvider)
   if (state.activeTab === 'usage') {
-    renderUsageShareChart('usageModelShare', '#usageModelShareChart', rangedUsage.byModel, null)
-    renderUsageShareChart('usageProviderShare', '#usageProviderShareChart', rangedUsage.byProvider, providerName)
+    renderUsageShareChart('usageModelShare', '#usageModelShareChart', '#usageModelShareLegend', rangedUsage.byModel, null)
+    renderUsageShareChart('usageProviderShare', '#usageProviderShareChart', '#usageProviderShareLegend', rangedUsage.byProvider, providerName)
   }
   renderUsageRows('#usageProviderRows', usage.byProvider, providerName)
   renderUsageRows('#usageModelRows', usage.byModel)
@@ -611,14 +672,14 @@ function renderTrendChart(series) {
 }
 
 function renderModelShareChart(byModel = {}) {
+  const data = buildShareChartData(byModel)
+  renderShareLegend('#modelShareLegend', data)
   if (!window.Chart) return
   const node = $('#modelShareChart')
-  const data = buildShareChartData(byModel)
 
   if (state.charts.modelShare) {
     state.charts.modelShare.data = data
     state.charts.modelShare.options.plugins.tooltip = shareTooltipOptions(data)
-    state.charts.modelShare.options.plugins.legend.labels.generateLabels = shareLegendLabels(data)
     state.charts.modelShare.update()
     return
   }
@@ -630,16 +691,16 @@ function renderModelShareChart(byModel = {}) {
   })
 }
 
-function renderUsageShareChart(chartKey, selector, buckets = {}, labelMapper = null) {
+function renderUsageShareChart(chartKey, selector, legendSelector, buckets = {}, labelMapper = null) {
+  const data = buildShareChartData(buckets, labelMapper)
+  renderShareLegend(legendSelector, data)
   if (!window.Chart) return
   const node = $(selector)
   if (!node) return
-  const data = buildShareChartData(buckets, labelMapper)
 
   if (state.charts[chartKey]) {
     state.charts[chartKey].data = data
     state.charts[chartKey].options.plugins.tooltip = shareTooltipOptions(data)
-    state.charts[chartKey].options.plugins.legend.labels.generateLabels = shareLegendLabels(data)
     state.charts[chartKey].update()
     return
   }
@@ -680,36 +741,37 @@ function buildShareChartData(buckets = {}, labelMapper = null) {
 function shareChartOptions(data) {
   return {
     responsive: true,
-    maintainAspectRatio: true,
-    cutout: '64%',
+    maintainAspectRatio: false,
+    cutout: '63%',
     plugins: {
-      legend: {
-        position: 'bottom',
-        labels: {
-          boxWidth: 10,
-          boxHeight: 10,
-          usePointStyle: true,
-          generateLabels: shareLegendLabels(data),
-        },
-      },
+      legend: { display: false },
       tooltip: shareTooltipOptions(data),
     },
   }
 }
 
-function shareLegendLabels(data) {
-  return (chart) => {
-    const values = chart.data.datasets[0]?.data || []
-    const total = sumValues(values)
-    const base = Chart.overrides.doughnut.plugins.legend.labels.generateLabels(chart)
-    return base.map((item) => {
-      const value = Number(values[item.index] || 0)
-      return {
-        ...item,
-        text: data._hasData ? `${item.text} · ${percentText(value, total)}` : item.text,
-      }
-    })
+function renderShareLegend(selector, data) {
+  const node = $(selector)
+  if (!node) return
+  if (!data._hasData) {
+    node.innerHTML = '<div class="share-legend-empty">暂无 Token 数据</div>'
+    return
   }
+
+  const values = data.datasets[0].data
+  const colors = data.datasets[0].backgroundColor
+  const total = sumValues(values)
+  node.innerHTML = data.labels.map((label, index) => {
+    const value = Number(values[index] || 0)
+    return `
+      <div class="share-legend-item" title="${escapeHtml(label)}：${formatTokenCompact(value)} Token，${percentText(value, total)}">
+        <span class="share-legend-swatch" style="--swatch:${colors[index]}"></span>
+        <span class="share-legend-label">${escapeHtml(label)}</span>
+        <strong>${percentText(value, total)}</strong>
+        <small>${formatTokenCompact(value)}</small>
+      </div>
+    `
+  }).join('')
 }
 
 function shareTooltipOptions(data) {
@@ -773,7 +835,7 @@ function renderRecords() {
       <td><strong>${new Date(log.time).toLocaleString()}</strong><br><small>${escapeHtml(log.method || '')} ${escapeHtml(log.path || '')}</small></td>
       <td><strong>${escapeHtml(log.model || '-')}</strong><br><small>${escapeHtml(log.routedModel || '-')}</small></td>
       <td><strong>${escapeHtml(log.providerName || '-')}</strong><br><small>${escapeHtml(credentialLabel)}</small></td>
-      <td>${logStatusPill(log)}<br><small>${escapeHtml(logStatusText(log))}</small></td>
+      <td>${logStatusPill(log)}<br><small>${escapeHtml(logStatusText(log))}</small>${logDiagnosticsMarkup(log, 2)}</td>
       <td><strong>${formatTokenCompact(usage.totalTokens)}</strong><br><small>入 ${formatTokenCompact(usage.inputTokens)} / 出 ${formatTokenCompact(usage.outputTokens)} / 缓存 ${cacheUsageText(usage)}${usage.estimated ? ' · 估算' : ''}</small></td>
       <td><strong>${log.durationMs ?? '-'} ms</strong></td>
       <td><small>${escapeHtml(attemptLine || log.error || '-')}</small></td>
@@ -1925,7 +1987,7 @@ function addTargetRow(target = {}) {
       <span>线路</span>
       <select name="providerId" required>
         <option value="">选择线路</option>
-        ${state.config.providers.map((provider) => `<option value="${provider.id}">${escapeHtml(provider.name)}</option>`).join('')}
+        ${state.config.providers.map((provider) => `<option value="${escapeHtml(provider.id)}">${escapeHtml(provider.name)}</option>`).join('')}
       </select>
     </label>
     <label>
@@ -2157,7 +2219,7 @@ function credentialSelect(provider) {
     `)
     .join('')
   return `
-    <select class="inline-select" data-action="switch-credential" data-id="${provider.id}" ${enabledCredentials.length ? '' : 'disabled'}>
+    <select class="inline-select" data-action="switch-credential" data-id="${escapeHtml(provider.id)}" ${enabledCredentials.length ? '' : 'disabled'}>
       ${options}
     </select>
     <small>${escapeHtml(credentialMeta(provider))}</small>
@@ -2305,7 +2367,57 @@ function logStatusText(log) {
     }
     return `${log.status ?? '-'} / 客户端中断`
   }
+  const diagnostic = firstLogDiagnostic(log)
+  if (diagnostic) return `${log.status ?? '-'} / ${diagnostic.title || diagnostic.code || '上游错误'}`
   return log.status ?? '-'
+}
+
+function firstLogDiagnostic(log) {
+  if (!Array.isArray(log?.diagnostics)) return null
+  return log.diagnostics.find((item) => item?.type === 'upstream_error') ||
+    log.diagnostics.find((item) => item && typeof item === 'object') ||
+    null
+}
+
+function logDiagnosticsMarkup(log, limit = 3) {
+  const diagnostics = prioritizeDiagnostics(Array.isArray(log?.diagnostics)
+    ? log.diagnostics.filter((item) => item && typeof item === 'object')
+    : [])
+  if (!diagnostics.length) return ''
+
+  const visible = diagnostics.slice(0, limit)
+  const hiddenCount = diagnostics.length - visible.length
+  return `
+    <div class="log-diagnostics">
+      ${visible.map((diagnostic) => {
+        const provider = diagnostic.providerName ? `${diagnostic.providerName} · ` : ''
+        const title = diagnostic.title || diagnostic.code || '诊断'
+        const message = diagnostic.message || ''
+        const suggestion = diagnostic.suggestion ? `建议：${diagnostic.suggestion}` : ''
+        return `
+          <div class="log-diagnostic">
+            <strong>${escapeHtml(provider + title)}</strong>
+            ${message ? `<span>${escapeHtml(message)}</span>` : ''}
+            ${suggestion ? `<small>${escapeHtml(suggestion)}</small>` : ''}
+          </div>
+        `
+      }).join('')}
+      ${hiddenCount > 0 ? `<small class="log-diagnostic-more">还有 ${hiddenCount} 条诊断</small>` : ''}
+    </div>
+  `
+}
+
+function prioritizeDiagnostics(diagnostics) {
+  const upstream = diagnostics.filter((item) => item.type === 'upstream_error')
+  const skippedKey = diagnostics.filter((item) => item.code === 'no_enabled_key')
+  const other = diagnostics.filter((item) => item.type !== 'upstream_error' && item.code !== 'no_enabled_key')
+  return [
+    ...upstream.slice(0, 2),
+    ...skippedKey.slice(0, 1),
+    ...upstream.slice(2),
+    ...skippedKey.slice(1),
+    ...other,
+  ]
 }
 
 function isClientDisconnected(log) {

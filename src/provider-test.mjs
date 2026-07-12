@@ -1,6 +1,7 @@
 import { buildCandidates } from './proxy.mjs'
-import { resolveActiveKey } from './config-store.mjs'
+import { resolveActiveCredential, resolveActiveKey } from './config-store.mjs'
 import { getCachedSystemProxy, resolveProviderOutboundProxy } from './outbound-proxy.mjs'
+import { hasCompletionPayload, upstreamErrorMessage } from './response-validation.mjs'
 import {
   buildWireBody,
   buildWirePlan,
@@ -12,6 +13,18 @@ import { upstreamFetch } from './upstream-fetch.mjs'
 
 export async function testProvider(provider, model = null, serviceConfig = {}) {
   const selectedModel = model || provider.models[0] || 'gpt-4o-mini'
+  const activeCredential = resolveActiveCredential(provider)
+  if (provider.authMode !== 'none' && !activeCredential) {
+    return {
+      ok: false,
+      status: 0,
+      latencyMs: 0,
+      model: selectedModel,
+      models: [],
+      reason: 'no_credential',
+      message: 'No enabled credential is available for this provider.',
+    }
+  }
   const startedAt = Date.now()
   const controller = new AbortController()
   const timeoutMs = resolveTestTimeout(serviceConfig.providerTestTimeoutMs, 3000, 120000, 30000)
@@ -24,18 +37,20 @@ export async function testProvider(provider, model = null, serviceConfig = {}) {
       signal: controller.signal,
       proxyUrl: resolveProviderProxy(provider, serviceConfig).proxyUrl,
     })
-    const models = response.ok ? await readModels(response) : []
+    const parsed = response.ok ? await readModels(response) : { models: [], errorMessage: '' }
+    const errorMessage = parsed.errorMessage
+    const ok = response.ok && !errorMessage && parsed.valid
 
     return {
-      ok: response.ok,
+      ok,
       status: response.status,
       latencyMs: Date.now() - startedAt,
       model: selectedModel,
-      models,
+      models: parsed.models,
       timeoutMs,
-      message: response.ok
-        ? `Provider responded to /v1/models. ${models.length} model(s) found.`
-        : await safeText(response),
+      message: ok
+        ? `Provider responded to /v1/models. ${parsed.models.length} model(s) found.`
+        : errorMessage || (response.ok ? 'Upstream returned an invalid /v1/models response.' : await safeText(response)),
     }
   } catch (error) {
     const timedOut = controller.signal.aborted
@@ -69,6 +84,17 @@ export async function realTestProvider(provider, input = {}, serviceConfig = {})
   const startedAt = Date.now()
   const wireApi = normalizeWireApi(input.wireApi) || provider.wireApi || 'chat'
   const timeoutMs = resolveTestTimeout(serviceConfig.providerRealTestTimeoutMs, 5000, 300000, 90000)
+
+  if (provider.authMode !== 'none' && !selectedCredential) {
+    return skippedRealTestResult({
+      provider,
+      selectedCredential,
+      selectedModel,
+      wireApi,
+      reason: 'no_credential',
+      message: 'No enabled credential is available for this provider.',
+    })
+  }
 
   if (!availableModels.length) {
     return skippedRealTestResult({
@@ -215,7 +241,7 @@ async function sendChatCompletion(provider, model, prompt, maxTokens, tokenField
       model,
       messages: [{ role: 'user', content: prompt }],
       temperature: 0,
-      stream: false,
+      stream: true,
       [tokenField]: maxTokens,
     }, { provider, model }, { collectUsage: false, collectStreamUsage: false }, plan)
     const headers = buildAuthHeaders(provider)
@@ -228,18 +254,20 @@ async function sendChatCompletion(provider, model, prompt, maxTokens, tokenField
       signal: controller.signal,
       proxyUrl: resolveProviderProxy(provider, serviceConfig).proxyUrl,
     })
-    const text = await response.text()
-    const payload = parseJson(text)
-    const transformedPayload = payload ? transformResponsePayload(payload, plan) : null
-    const content = readCompletionText(transformedPayload)
+    const contentType = response.headers.get('content-type') || ''
+    const parsed = contentType.includes('text/event-stream')
+      ? await readStreamingCompletion(response, plan.upstreamApi)
+      : await readJsonCompletion(response, plan)
+    const errorMessage = parsed.errorMessage
+    const ok = response.ok && !errorMessage && parsed.hasCompletion
 
     return {
-      ok: response.ok,
+      ok,
       status: response.status,
-      content,
-      usage: normalizeUsagePayload(transformedPayload?.usage),
-      rawUsage: transformedPayload?.usage || null,
-      message: response.ok ? 'ok' : preview(text || `HTTP ${response.status}`),
+      content: parsed.content,
+      usage: parsed.usage,
+      rawUsage: parsed.rawUsage,
+      message: ok ? 'ok' : errorMessage || preview(parsed.rawText || `HTTP ${response.status}`),
     }
   } catch (error) {
     const timedOut = controller.signal.aborted
@@ -256,6 +284,83 @@ async function sendChatCompletion(provider, model, prompt, maxTokens, tokenField
     }
   } finally {
     clearTimeout(timeout)
+  }
+}
+
+async function readJsonCompletion(response, plan) {
+  const rawText = await response.text()
+  const payload = parseJson(rawText)
+  const transformedPayload = payload ? transformResponsePayload(payload, plan) : null
+  return {
+    content: readCompletionText(transformedPayload),
+    usage: normalizeUsagePayload(transformedPayload?.usage),
+    rawUsage: transformedPayload?.usage || null,
+    errorMessage: upstreamErrorMessage(payload) || upstreamErrorMessage(transformedPayload),
+    hasCompletion: hasCompletionPayload(payload, plan.upstreamApi) || hasCompletionPayload(transformedPayload, plan.incomingApi),
+    rawText,
+  }
+}
+
+async function readStreamingCompletion(response, wireApi) {
+  if (!response.body) {
+    return {
+      content: '',
+      usage: null,
+      rawUsage: null,
+      errorMessage: 'Upstream returned an empty stream.',
+      hasCompletion: false,
+      rawText: '',
+    }
+  }
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let content = ''
+  let usage = null
+  let errorMessage = ''
+  let hasCompletion = false
+
+  const consume = (data) => {
+    if (!data || data === '[DONE]') {
+      if (data === '[DONE]') hasCompletion = true
+      return
+    }
+    const payload = parseJson(data)
+    if (!payload) return
+    errorMessage ||= upstreamErrorMessage(payload)
+    if (wireApi === 'responses') {
+      if (payload.type === 'response.output_text.delta' && typeof payload.delta === 'string') content += payload.delta
+      else if (typeof payload.text === 'string') content += payload.text
+      if (hasCompletionPayload(payload, wireApi)) hasCompletion = true
+    } else {
+      const choice = Array.isArray(payload.choices) ? payload.choices[0] : null
+      if (typeof choice?.delta?.content === 'string') content += choice.delta.content
+      if (Array.isArray(payload.choices) && payload.choices.length > 0) hasCompletion = true
+    }
+    usage = normalizeUsagePayload(payload.usage || payload.response?.usage) || usage
+  }
+
+  while (true) {
+    const { value, done } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    const lines = buffer.split(/\r?\n/)
+    buffer = lines.pop() || ''
+    for (const line of lines) {
+      const trimmed = line.trim()
+      if (trimmed.startsWith('data:')) consume(trimmed.slice(5).trim())
+    }
+  }
+  if (buffer.trim().startsWith('data:')) consume(buffer.trim().slice(5).trim())
+
+  return {
+    content,
+    usage,
+    rawUsage: usage,
+    errorMessage,
+    hasCompletion: hasCompletion || Boolean(content),
+    rawText: content,
   }
 }
 
@@ -294,10 +399,10 @@ export function previewRoute(config, stateStore, model) {
 function buildAuthHeaders(provider) {
   const headers = new Headers()
   const apiKey = resolveActiveKey(provider)
-  if (provider.authMode === 'authorization' || provider.authMode === 'both') {
+  if (apiKey && (provider.authMode === 'authorization' || provider.authMode === 'both')) {
     headers.set('authorization', `Bearer ${apiKey}`)
   }
-  if (provider.authMode === 'x-api-key' || provider.authMode === 'both') {
+  if (apiKey && (provider.authMode === 'x-api-key' || provider.authMode === 'both')) {
     headers.set('x-api-key', apiKey)
   }
   return headers
@@ -309,7 +414,6 @@ function selectCredential(provider, credentialId) {
     credentials.find((credential) => credential.id === credentialId && credential.enabled) ||
     credentials.find((credential) => credential.id === provider.activeCredentialId && credential.enabled) ||
     credentials.find((credential) => credential.enabled) ||
-    credentials[0] ||
     null
   )
 }
@@ -395,13 +499,18 @@ function preview(value, maxLength = 500) {
 
 async function readModels(response) {
   try {
-    const payload = await response.json()
-    if (!Array.isArray(payload?.data)) return []
-    return [...new Set(payload.data
+    const text = await response.text()
+    const payload = parseJson(text)
+    const errorMessage = upstreamErrorMessage(payload)
+    if (!payload || !Array.isArray(payload.data)) {
+      return { models: [], valid: false, errorMessage: errorMessage || preview(text || 'Invalid /v1/models response.') }
+    }
+    const models = [...new Set(payload.data
       .map((item) => (typeof item?.id === 'string' ? item.id.trim() : ''))
       .filter(Boolean))]
       .sort()
+    return { models, valid: true, errorMessage }
   } catch {
-    return []
+    return { models: [], valid: false, errorMessage: 'Invalid JSON returned by /v1/models.' }
   }
 }
