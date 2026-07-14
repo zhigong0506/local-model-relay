@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 3,
   "service": {
     "enabled": true,
     "listenHost": "127.0.0.1",
@@ -8,19 +8,46 @@
     "requestTimeoutMs": 90000,
     "providerTestTimeoutMs": 30000,
     "providerRealTestTimeoutMs": 90000,
-    "retryStatusCodes": [401, 402, 403, 408, 409, 425, 429, 500, 502, 503, 504],
+    "retryStatusCodes": [401, 402, 403, 408, 409, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524],
     "maxAttempts": 8,
     "defaultCooldownSeconds": 60,
     "reconnectFailureThreshold": 4,
     "reconnectCooldownSeconds": 600,
+    "sessionAffinity": true,
+    "sessionTtlSeconds": 86400,
+    "sessionLimit": 800,
     "logRequests": true,
     "collectUsage": true,
     "collectStreamUsage": true,
     "quotaPerCny": 500000,
     "requestLogLimit": 1500,
     "outboundProxyMode": "direct",
-    "outboundProxyUrl": ""
+    "outboundProxyUrl": "",
+    "capabilityRouting": false,
+    "diagnosticsLlm": {
+      "enabled": false,
+      "baseUrl": "",
+      "apiKey": "",
+      "model": "",
+      "timeoutMs": 30000
+    }
   },
+  "providerGroups": [
+    {
+      "id": "openai",
+      "name": "OpenAI",
+      "description": "OpenAI 与 OpenAI-compatible 中转线路",
+      "color": "#7567d8",
+      "priority": 10
+    },
+    {
+      "id": "deepseek",
+      "name": "DeepSeek",
+      "description": "DeepSeek 模型与兼容中转线路",
+      "color": "#159a80",
+      "priority": 20
+    }
+  ],
   "providers": [],
   "routes": [],
   "updatedAt": null

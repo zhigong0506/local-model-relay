@@ -34,6 +34,11 @@ const STATUS_DIAGNOSTICS = new Map([
     title: '上游请求冲突',
     suggestion: '检查上游并发、会话状态和请求参数，稍后重试。',
   }],
+  [413, {
+    code: 'upstream_payload_too_large',
+    title: '请求内容超过上游限制',
+    suggestion: '减少上下文、图片或附件内容，检查模型上下文窗口与上游请求体限制；该错误不会盲目切换线路。',
+  }],
   [425, {
     code: 'upstream_overloaded',
     title: '上游暂时过载',
@@ -63,6 +68,31 @@ const STATUS_DIAGNOSTICS = new Map([
     code: 'upstream_gateway_timeout',
     title: '上游网关超时',
     suggestion: '检查上游响应速度和代理链路，必要时提高超时或切换线路。',
+  }],
+  [520, {
+    code: 'upstream_web_server_unknown_error',
+    title: '上游 Web Server 未知错误',
+    suggestion: '检查中转站源站、网关和代理链路；该错误通常需要等待上游恢复或切换线路。',
+  }],
+  [521, {
+    code: 'upstream_web_server_down',
+    title: '上游 Web Server 已关闭或拒绝连接',
+    suggestion: '检查中转站源站是否宕机、拒绝连接或被防火墙拦截，建议切换备用线路。',
+  }],
+  [522, {
+    code: 'upstream_origin_connection_timeout',
+    title: '上游源站连接超时',
+    suggestion: '上游网关无法及时连上源站；检查源站负载、网络和线路代理，必要时切换线路。',
+  }],
+  [523, {
+    code: 'upstream_origin_unreachable',
+    title: '上游源站不可达',
+    suggestion: '上游网关无法找到或访问源站；检查源站 DNS、网络和地区访问限制，建议切换线路。',
+  }],
+  [524, {
+    code: 'upstream_origin_response_timeout',
+    title: '上游源站响应超时',
+    suggestion: '上游已连上源站但等待响应超时，常见于服务过载或模型推理过慢；建议切换线路。',
   }],
 ])
 
@@ -186,6 +216,16 @@ export function describeRoutingSkip(provider, reason, model = '') {
       title: '线路不支持该模型',
       message: `没有配置模型「${model || '(未指定)'}」，未参与本次请求。`,
       suggestion: '检查线路支持模型列表，或为该模型新增模型路由。',
+    }
+  }
+
+  if (reason === 'codex_unverified') {
+    return {
+      ...base,
+      code: 'provider_codex_unverified',
+      title: '线路未通过 Codex 验证',
+      message: `模型「${model || '(未指定)'}」尚未完成或未通过真实 Codex Responses 文本与工具调用测试，未参与本次请求。`,
+      suggestion: '在线路页运行“Codex 验证”；通过后才会参与启用了能力筛选的 Codex 路由。',
     }
   }
 

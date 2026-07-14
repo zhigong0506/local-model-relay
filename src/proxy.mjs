@@ -6,6 +6,7 @@ import {
   buildWireBody,
   buildWirePlan,
   buildWireUrl,
+  createWireStreamTransformer,
   normalizeUsagePayload,
   transformWireResponse,
 } from './wire-api.mjs'
@@ -23,11 +24,16 @@ const HOP_BY_HOP_HEADERS = new Set([
   'transfer-encoding',
   'upgrade',
 ])
+const LOCAL_RELAY_HEADERS = new Set([
+  'x-local-relay-session',
+  'x-local-model-relay-session',
+])
 
 const MAX_REQUEST_BODY_BYTES = 25 * 1024 * 1024
 const MAX_USAGE_SNIFF_BYTES = 10 * 1024 * 1024
 const MAX_STREAM_INSPECT_CHARS = 1024 * 1024
 const MAX_STREAM_PRELUDE_BYTES = 256 * 1024
+const MAX_RESPONSE_ID_SNIFF_BYTES = 512 * 1024
 const CLIENT_ABORTED_CODE = 'CLIENT_ABORTED'
 const UPSTREAM_STREAM_FAILED_CODE = 'UPSTREAM_STREAM_FAILED'
 const UPSTREAM_STREAM_INCOMPLETE_CODE = 'UPSTREAM_STREAM_INCOMPLETE'
@@ -100,13 +106,29 @@ export async function handleProxyRequest(req, res, context) {
 
   const virtualModel = typeof body.model === 'string' ? body.model : ''
   const route = findRoute(config, virtualModel)
-  const candidateContext = buildCandidateContext(config, route, virtualModel, stateStore)
+  const sessionContext = resolveSessionContext(req, body, stateStore, config.service)
+  const candidateContext = buildCandidateContext(
+    config,
+    route,
+    virtualModel,
+    stateStore,
+    sessionContext.preferredProviderId,
+    isCodexCapabilityRequired(req.url, config.service),
+  )
   const candidates = candidateContext.candidates
-  const routingDiagnostics = candidateContext.diagnostics
+  const routingDiagnostics = [
+    ...candidateContext.diagnostics,
+    ...sessionAffinityDiagnostics(sessionContext, candidates, config, virtualModel, candidateContext.pinned),
+  ]
   const attempts = []
   let lastError = null
 
   if (candidates.length === 0) {
+    const pinned = candidateContext.pinned
+    const errorType = pinned ? 'pinned_start_unavailable' : 'no_available_provider'
+    const message = pinned
+      ? `Pinned start provider "${pinned.providerName || 'unknown'}" cannot route model "${virtualModel || '(missing)'}".`
+      : `No available provider route for model "${virtualModel || '(missing)'}".`
     addRequestLog(config, stateStore, {
       method: req.method,
       path: req.url,
@@ -115,13 +137,14 @@ export async function handleProxyRequest(req, res, context) {
       ok: false,
       attempts: [],
       durationMs: Date.now() - startedAt,
-      error: 'No available provider route.',
+      error: message,
+      outcome: errorType,
       diagnostics: routingDiagnostics,
     })
     return sendJson(res, 503, {
       error: {
-        type: 'no_available_provider',
-        message: `No available provider route for model "${virtualModel || '(missing)'}".`,
+        type: errorType,
+        message,
       },
       diagnostics: routingDiagnostics,
     })
@@ -147,6 +170,7 @@ export async function handleProxyRequest(req, res, context) {
       attempt.latencyMs = latencyMs
       let capturedUsage = null
       let streamInfo = null
+      let responseId = ''
 
       if (shouldRetryStatus(upstreamResponse.status, config.service.retryStatusCodes)) {
         const message = redactSecretText(
@@ -176,6 +200,7 @@ export async function handleProxyRequest(req, res, context) {
         })
         capturedUsage = piped.usage
         streamInfo = piped.stream
+        responseId = piped.responseId || ''
       } catch (streamError) {
         upstream.abort()
         const message = redactSecretText(
@@ -302,6 +327,15 @@ export async function handleProxyRequest(req, res, context) {
           latencyMs,
         })
         stateStore.advanceStartProvider?.(candidate.provider.id)
+        persistSessionAffinity(
+          stateStore,
+          sessionContext,
+          req.url,
+          responseId,
+          candidate,
+          virtualModel,
+          config.service,
+        )
         if (capturedUsage) {
           stateStore.recordUsage(candidate.provider.id, candidate.model, capturedUsage, {
             credentialId: attempt.credentialId,
@@ -360,6 +394,12 @@ export async function handleProxyRequest(req, res, context) {
     }
   }
 
+  const pinned = candidateContext.pinned
+  const failureType = pinned ? 'pinned_provider_failed' : 'all_providers_failed'
+  const failureMessage = pinned
+    ? lastError?.message || `Pinned start provider "${pinned.providerName || 'unknown'}" failed.`
+    : lastError?.message || 'Every provider failed.'
+
   addRequestLog(config, stateStore, {
     method: req.method,
     path: req.url,
@@ -368,15 +408,15 @@ export async function handleProxyRequest(req, res, context) {
     ok: false,
     attempts: attempts.map(publicAttempt),
     durationMs: Date.now() - startedAt,
-    error: lastError?.message || 'Every provider failed.',
-    outcome: 'all_providers_failed',
+    error: failureMessage,
+    outcome: failureType,
     diagnostics: requestDiagnostics(routingDiagnostics, attempts),
   })
 
   return sendJson(res, lastError?.status && lastError.status >= 400 ? lastError.status : 502, {
     error: {
-      type: 'all_providers_failed',
-      message: lastError?.message || 'Every provider failed.',
+      type: failureType,
+      message: failureMessage,
     },
     attempts: attempts.map(publicAttempt),
     diagnostics: requestDiagnostics(routingDiagnostics, attempts),
@@ -392,13 +432,14 @@ export function findRoute(config, virtualModel) {
   return config.routes.find((route) => route.enabled && route.virtualModel === virtualModel) || null
 }
 
-export function buildCandidates(config, route, virtualModel, stateStore) {
-  return buildCandidateContext(config, route, virtualModel, stateStore).candidates
+export function buildCandidates(config, route, virtualModel, stateStore, preferredProviderId = '') {
+  return buildCandidateContext(config, route, virtualModel, stateStore, preferredProviderId).candidates
 }
 
-function buildCandidateContext(config, route, virtualModel, stateStore) {
+function buildCandidateContext(config, route, virtualModel, stateStore, preferredProviderId = '', requireCodexCapability = false) {
   const providers = [...config.providers].sort((a, b) => a.priority - b.priority || a.name.localeCompare(b.name))
   const providersById = new Map(providers.map((provider) => [provider.id, provider]))
+  const routing = currentRouting(stateStore)
   const now = Date.now()
   const candidates = []
   const diagnostics = []
@@ -408,21 +449,18 @@ function buildCandidateContext(config, route, virtualModel, stateStore) {
       const provider = providersById.get(target.providerId)
       if (!provider) continue
 
-      const reason = providerSkipReason(provider, stateStore, now)
+      const reason = providerSkipReason(provider, stateStore, now, null, target.model, requireCodexCapability)
       if (reason) {
         diagnostics.push(describeRoutingSkip(provider, reason, target.model))
         continue
       }
       candidates.push({ provider, model: target.model })
     }
-    return {
-      candidates: rotateToStart(candidates, stateStore.getStartProviderId?.()),
-      diagnostics,
-    }
+    return finalizeCandidateContext(candidates, diagnostics, providersById, route, virtualModel, routing, preferredProviderId)
   }
 
   for (const provider of providers) {
-    const reason = providerSkipReason(provider, stateStore, now, virtualModel)
+    const reason = providerSkipReason(provider, stateStore, now, virtualModel, virtualModel, requireCodexCapability)
     if (reason) {
       diagnostics.push(describeRoutingSkip(provider, reason, virtualModel))
       continue
@@ -430,18 +468,180 @@ function buildCandidateContext(config, route, virtualModel, stateStore) {
     candidates.push({ provider, model: virtualModel })
   }
 
+  return finalizeCandidateContext(candidates, diagnostics, providersById, route, virtualModel, routing, preferredProviderId)
+}
+
+function finalizeCandidateContext(candidates, diagnostics, providersById, route, virtualModel, routing, preferredProviderId) {
+  const pinnedProviderId = routing.startMode === 'pinned' ? routing.startProviderId : ''
+  if (pinnedProviderId) {
+    const provider = providersById.get(pinnedProviderId)
+    const pinned = {
+      providerId: pinnedProviderId,
+      providerName: provider?.name || '',
+    }
+    const candidate = candidates.find((item) => item.provider.id === pinnedProviderId)
+    if (candidate) return { candidates: [candidate], diagnostics, pinned, routing }
+
+    diagnostics.push(describePinnedStartUnavailable(provider, route, virtualModel))
+    return { candidates: [], diagnostics, pinned, routing }
+  }
+
   return {
-    candidates: rotateToStart(candidates, stateStore.getStartProviderId?.()),
+    candidates: rotateToStart(candidates, preferredProviderId || routing.startProviderId),
     diagnostics,
+    pinned: null,
+    routing,
   }
 }
 
-function providerSkipReason(provider, stateStore, now, virtualModel = null) {
+function currentRouting(stateStore) {
+  const routing = stateStore.getRouting?.() || {}
+  const startProviderId = typeof routing.startProviderId === 'string'
+    ? routing.startProviderId
+    : stateStore.getStartProviderId?.() || ''
+  const startMode = routing.startMode === 'pinned'
+    ? 'pinned'
+    : routing.startMode === 'locked'
+      ? 'locked'
+      : 'auto'
+  return { startProviderId, startMode }
+}
+
+function describePinnedStartUnavailable(provider, route, model) {
+  const providerName = provider?.name || '当前起点'
+  const isRouteTarget = Boolean(route?.targets?.some((target) => target.providerId === provider?.id))
+  return {
+    type: 'routing_lock',
+    code: 'pinned_start_unavailable',
+    status: 0,
+    providerId: provider?.id || '',
+    providerName,
+    model,
+    title: '单线锁定无法转发',
+    message: route && !isRouteTarget
+      ? `当前起点线路「${providerName}」不是模型「${model || '(未指定)'}」的路由目标。`
+      : `当前起点线路「${providerName}」目前无法处理模型「${model || '(未指定)'}」。`,
+    suggestion: '检查起点线路的开关、Key、冷却状态、支持模型和模型路由；修复后重试，或切换为允许故障转移的模式。',
+  }
+}
+
+function providerSkipReason(provider, stateStore, now, virtualModel = null, routedModel = '', requireCodexCapability = false) {
   if (!provider.enabled) return 'provider_disabled'
   if (provider.authMode !== 'none' && !resolveActiveKey(provider)) return 'no_enabled_key'
   if (stateStore.isCooling(provider.id, now)) return 'cooldown'
   if (virtualModel !== null && provider.models.length > 0 && !provider.models.includes(virtualModel)) return 'unsupported_model'
+  if (requireCodexCapability && !hasVerifiedCodexCapability(provider, routedModel || virtualModel)) return 'codex_unverified'
   return ''
+}
+
+function hasVerifiedCodexCapability(provider, model) {
+  const result = provider?.capabilities?.codex?.models?.[model]
+  return result?.status === 'verified'
+}
+
+function isCodexCapabilityRequired(requestUrl, serviceConfig = {}) {
+  if (serviceConfig.capabilityRouting !== true) return false
+  const path = new URL(requestUrl, 'http://local').pathname.replace(/\/+$/, '')
+  return path === '/v1/responses' || path === '/responses'
+}
+
+function resolveSessionContext(req, body, stateStore, serviceConfig) {
+  if (serviceConfig.sessionAffinity === false) {
+    return { keys: [], preferredProviderId: '', binding: null }
+  }
+
+  const keys = []
+  const headerValue = sessionValue(
+    req.headers['x-local-relay-session'] || req.headers['x-local-model-relay-session'],
+  )
+  if (headerValue) keys.push({ kind: 'client', value: headerValue, source: 'header' })
+
+  const metadata = body?.metadata && typeof body.metadata === 'object' && !Array.isArray(body.metadata)
+    ? body.metadata
+    : null
+  const metadataValue = sessionValue(metadata?.local_relay_session_id || metadata?.local_model_relay_session_id)
+  if (metadataValue) keys.push({ kind: 'client', value: metadataValue, source: 'metadata' })
+
+  const previousResponseId = sessionValue(body?.previous_response_id)
+  if (previousResponseId) keys.push({ kind: 'response', value: previousResponseId, source: 'previous_response_id' })
+
+  for (const key of keys) {
+    const binding = stateStore.getSessionBinding?.(key.kind, key.value)
+    if (binding?.providerId) {
+      return {
+        keys,
+        preferredProviderId: binding.providerId,
+        binding: { ...binding, source: key.source },
+      }
+    }
+  }
+
+  return { keys, preferredProviderId: '', binding: null }
+}
+
+function sessionAffinityDiagnostics(sessionContext, candidates, config, virtualModel, pinned = null) {
+  if (!sessionContext.binding?.providerId) return []
+  if (pinned?.providerId && sessionContext.binding.providerId !== pinned.providerId) {
+    const provider = config.providers.find((item) => item.id === pinned.providerId)
+    return [{
+      type: 'session_affinity',
+      code: 'session_affinity_overridden_by_pinned_start',
+      title: '会话线路亲和已被单线锁定覆盖',
+      message: `单线锁定要求本次请求固定使用起点线路「${provider?.name || pinned.providerName || '已删除线路'}」。`,
+      suggestion: '如需恢复会话原线路或允许备用线路，请切换为“锁定起点”或“自动推进”。',
+      providerId: pinned.providerId,
+      providerName: provider?.name || pinned.providerName || '',
+      model: virtualModel,
+      source: sessionContext.binding.source,
+    }]
+  }
+  if (candidates.some((candidate) => candidate.provider.id === sessionContext.binding.providerId)) return []
+  const provider = config.providers.find((item) => item.id === sessionContext.binding.providerId)
+  return [{
+    type: 'session_affinity',
+    code: 'session_affinity_bypassed',
+    title: '会话线路亲和已绕过',
+    message: `已绑定的线路「${provider?.name || '已删除线路'}」当前无法处理模型「${virtualModel || '(未指定)'}」。`,
+    suggestion: '已按普通路由继续尝试；请检查绑定线路的开关、Key、冷却状态和模型支持列表。',
+    providerId: sessionContext.binding.providerId,
+    providerName: provider?.name || '',
+    model: virtualModel,
+    source: sessionContext.binding.source,
+  }]
+}
+
+function persistSessionAffinity(stateStore, sessionContext, requestUrl, responseId, candidate, virtualModel, serviceConfig) {
+  if (serviceConfig.sessionAffinity === false) return
+  const keys = [...sessionContext.keys]
+  if (isResponsesRequest(requestUrl) && responseId) {
+    keys.push({ kind: 'response', value: responseId, source: 'response_id' })
+  }
+  const seen = new Set()
+  for (const key of keys) {
+    const fingerprint = `${key.kind}:${key.value}`
+    if (seen.has(fingerprint)) continue
+    seen.add(fingerprint)
+    stateStore.setSessionBinding?.(key.kind, key.value, {
+      providerId: candidate.provider.id,
+      model: virtualModel,
+      protocol: isResponsesRequest(requestUrl) ? 'responses' : 'chat',
+      source: key.source,
+    }, {
+      ttlSeconds: serviceConfig.sessionTtlSeconds,
+      limit: serviceConfig.sessionLimit,
+    })
+  }
+}
+
+function isResponsesRequest(requestUrl) {
+  const path = new URL(requestUrl, 'http://local').pathname.replace(/\/+$/, '')
+  return path === '/v1/responses' || path === '/responses'
+}
+
+function sessionValue(value) {
+  const text = Array.isArray(value) ? value[0] : value
+  if (typeof text !== 'string') return ''
+  return text.trim().slice(0, 1024)
 }
 
 function rotateToStart(candidates, startProviderId = '') {
@@ -485,7 +685,7 @@ function buildHeaders(source, provider) {
 
   for (const [name, value] of Object.entries(source)) {
     const lower = name.toLowerCase()
-    if (HOP_BY_HOP_HEADERS.has(lower) || lower === 'authorization' || lower === 'x-api-key') continue
+    if (HOP_BY_HOP_HEADERS.has(lower) || LOCAL_RELAY_HEADERS.has(lower) || lower === 'authorization' || lower === 'x-api-key') continue
     if (Array.isArray(value)) {
       headers.set(name, value.join(', '))
     } else if (value !== undefined) {
@@ -553,9 +753,10 @@ async function pipeUpstreamResponse(upstreamResponse, res, candidate, attemptsCo
   res.setHeader('x-local-relay-model', encodeURIComponent(candidate.model))
   res.setHeader('x-local-relay-attempts', String(attemptsCount))
 
-  if (options.wirePlan?.transform) {
-    const usage = await transformWireResponse(upstreamResponse, res, options.wirePlan)
-    return { usage, stream: null }
+  const transformsStream = Boolean(options.wirePlan?.transform) && contentType.includes('text/event-stream')
+  if (options.wirePlan?.transform && !transformsStream) {
+    const transformed = await transformWireResponse(upstreamResponse, res, options.wirePlan)
+    return { usage: transformed.usage, stream: null, responseId: transformed.responseId }
   }
 
   if (!upstreamResponse.body) {
@@ -565,6 +766,8 @@ async function pipeUpstreamResponse(upstreamResponse, res, candidate, attemptsCo
 
   const usageCollector = createUsageCollector(upstreamResponse, options.collectUsage, options.requestBody)
   const streamInspector = createStreamInspector(upstreamResponse)
+  const responseIdCollector = createResponseIdCollector(upstreamResponse)
+  const wireTransformer = transformsStream ? createWireStreamTransformer(options.wirePlan) : null
   const clientAbort = new AbortController()
   let clientDisconnected = false
   let idleTimedOut = false
@@ -579,6 +782,13 @@ async function pipeUpstreamResponse(upstreamResponse, res, candidate, attemptsCo
     for (const chunk of preludeChunks.splice(0)) {
       await writeResponseChunk(res, chunk)
     }
+  }
+
+  const writeOrBuffer = async (chunk) => {
+    if (streamCommitted) return writeResponseChunk(res, chunk)
+    const buffered = Buffer.from(chunk)
+    preludeChunks.push(buffered)
+    preludeBytes += buffered.length
   }
 
   const armIdleTimeout = () => {
@@ -607,16 +817,14 @@ async function pipeUpstreamResponse(upstreamResponse, res, candidate, attemptsCo
         armIdleTimeout()
         usageCollector.ingest(chunk)
         streamInspector.ingest(chunk)
-        if (streamCommitted) return writeResponseChunk(res, chunk)
-
-        const buffered = Buffer.from(chunk)
-        preludeChunks.push(buffered)
-        preludeBytes += buffered.length
+        responseIdCollector.ingest(chunk)
         const snapshot = streamInspector.snapshot()
 
         if (snapshot.failureReason) {
           throw makeUpstreamStreamError(snapshot.failureReason, snapshot)
         }
+        const outputs = wireTransformer ? wireTransformer.ingest(chunk) : [chunk]
+        for (const output of outputs) await writeOrBuffer(output)
         if (snapshot.sawMeaningfulOutput || streamCompletionReason(snapshot) || preludeBytes >= MAX_STREAM_PRELUDE_BYTES) {
           await flushPrelude()
         }
@@ -625,12 +833,16 @@ async function pipeUpstreamResponse(upstreamResponse, res, candidate, attemptsCo
         clearTimeout(idleTimeout)
         usageCollector.finish()
         streamInspector.finish()
+        responseIdCollector.finish()
         const snapshot = streamInspector.snapshot()
         if (snapshot.failureReason) {
           throw makeUpstreamStreamError(snapshot.failureReason, snapshot)
         }
         if (snapshot.isStream && !streamCompletionReason(snapshot)) {
           throw makeUpstreamStreamIncompleteError(snapshot)
+        }
+        if (wireTransformer) {
+          for (const output of wireTransformer.finish()) await writeOrBuffer(output)
         }
         await flushPrelude()
         if (!res.writableEnded) res.end()
@@ -662,8 +874,9 @@ async function pipeUpstreamResponse(upstreamResponse, res, candidate, attemptsCo
   }
 
   return {
-    usage: usageCollector.usage,
+    usage: usageCollector.usage || wireTransformer?.usage() || null,
     stream: streamInspector.snapshot(),
+    responseId: wireTransformer?.responseId() || streamInspector.snapshot().responseId || responseIdCollector.responseId() || '',
   }
 }
 
@@ -686,6 +899,7 @@ function createStreamInspector(response) {
     sawChatFinish: false,
     sawMeaningfulOutput: false,
     failureReason: '',
+    responseId: '',
   }
 
   const processText = (text) => {
@@ -704,6 +918,8 @@ function createStreamInspector(response) {
       try {
         const payload = JSON.parse(data)
         const type = typeof payload?.type === 'string' ? payload.type : ''
+        const responseId = responseIdFromStreamPayload(payload, type)
+        if (responseId) state.responseId = responseId
         if (type) {
           state.eventCount += 1
           state.lastEventType = type
@@ -766,6 +982,60 @@ function createStreamInspector(response) {
       }
     },
   }
+}
+
+function createResponseIdCollector(response) {
+  const contentType = response.headers.get('content-type') || ''
+  if (!isJsonContentType(contentType)) {
+    return {
+      ingest() {},
+      finish() {},
+      responseId() { return '' },
+    }
+  }
+
+  const chunks = []
+  let totalBytes = 0
+  let disabled = false
+  let id = ''
+
+  return {
+    ingest(chunk) {
+      if (disabled || id) return
+      const bytes = Buffer.from(chunk)
+      totalBytes += bytes.length
+      if (totalBytes > MAX_RESPONSE_ID_SNIFF_BYTES) {
+        disabled = true
+        chunks.length = 0
+        return
+      }
+      chunks.push(bytes)
+    },
+    finish() {
+      if (disabled || id || chunks.length === 0) return
+      try {
+        const payload = JSON.parse(Buffer.concat(chunks, totalBytes).toString('utf8'))
+        id = responseIdFromJsonPayload(payload)
+      } catch {}
+      chunks.length = 0
+    },
+    responseId() {
+      return id
+    },
+  }
+}
+
+function responseIdFromJsonPayload(payload) {
+  if (typeof payload?.id === 'string' && payload.id) return payload.id
+  if (typeof payload?.response?.id === 'string' && payload.response.id) return payload.response.id
+  return ''
+}
+
+function responseIdFromStreamPayload(payload, type) {
+  if (typeof payload?.response_id === 'string' && payload.response_id) return payload.response_id
+  if (typeof payload?.response?.id === 'string' && payload.response.id) return payload.response.id
+  if (type.startsWith('response.') && typeof payload?.id === 'string' && payload.id) return payload.id
+  return ''
 }
 
 function streamCompletionReason(stream) {

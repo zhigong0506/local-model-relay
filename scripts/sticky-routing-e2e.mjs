@@ -56,14 +56,16 @@ try {
   createdRouteId = route.id
 
   const locked = await lockedStartCheck(localKey)
+  const pinned = await pinnedStartCheck(localKey)
   const auto = await autoAdvanceCheck(localKey)
   const disabled = await disabledStartCheck(localKey)
   const pruned = await pruneCheck()
 
   const report = {
-    ok: locked.ok && auto.ok && disabled.ok && pruned.ok,
+    ok: locked.ok && pinned.ok && auto.ok && disabled.ok && pruned.ok,
     model,
     locked,
+    pinned,
     auto,
     disabled,
     pruned,
@@ -99,6 +101,57 @@ async function lockedStartCheck(localKey) {
     hitOrder: hitNames(),
     startProviderId: routing.startProviderId,
     startMode: routing.startMode,
+  }
+}
+
+async function pinnedStartCheck(localKey) {
+  hits.length = 0
+  await api('/api/routing/start', {
+    method: 'POST',
+    body: { providerId: createdProviders[2].id, mode: 'pinned' },
+  })
+
+  const failing = await relayChat(localKey)
+  const routingAfterFailure = (await api('/api/state')).routing
+  const failHitOrder = hitNames()
+
+  await api(`/api/providers/${createdProviders[2].id}`, {
+    method: 'PATCH',
+    body: { enabled: false },
+  })
+  hits.length = 0
+  const disabled = await relayChat(localKey)
+  await api(`/api/providers/${createdProviders[2].id}`, {
+    method: 'PATCH',
+    body: { enabled: true },
+  })
+  const routingAfterDisabled = (await api('/api/state')).routing
+
+  return {
+    ok: failing.status === 502 &&
+      failing.errorType === 'pinned_provider_failed' &&
+      failing.attempts?.length === 1 &&
+      failHitOrder.join('|') === 'Sticky 03 FAIL' &&
+      disabled.status === 503 &&
+      disabled.errorType === 'pinned_start_unavailable' &&
+      hitNames().length === 0 &&
+      routingAfterFailure.startProviderId === createdProviders[2].id &&
+      routingAfterFailure.startMode === 'pinned' &&
+      routingAfterDisabled.startMode === 'pinned',
+    failing: {
+      status: failing.status,
+      errorType: failing.errorType,
+      attempts: failing.attempts?.length || 0,
+      hitOrder: failHitOrder,
+      startMode: routingAfterFailure.startMode,
+    },
+    disabled: {
+      status: disabled.status,
+      errorType: disabled.errorType,
+      diagnostics: disabled.diagnostics?.map((item) => item.code) || [],
+      hitOrder: hitNames(),
+      startMode: routingAfterDisabled.startMode,
+    },
   }
 }
 
@@ -174,13 +227,13 @@ async function disabledStartCheck(localKey) {
 async function pruneCheck() {
   await api('/api/routing/start', {
     method: 'POST',
-    body: { providerId: createdProviders[2].id, mode: 'locked' },
+    body: { providerId: createdProviders[2].id, mode: 'pinned' },
   })
   await api(`/api/providers/${createdProviders[2].id}`, { method: 'DELETE' })
   const deleted = createdProviders.splice(2, 1)[0]
   const routing = (await api('/api/state')).routing
   return {
-    ok: deleted.id && routing.startProviderId === '' && routing.startMode === 'locked',
+    ok: deleted.id && routing.startProviderId === '' && routing.startMode === 'auto',
     deletedProviderId: deleted.id,
     startProviderId: routing.startProviderId,
     startMode: routing.startMode,
@@ -239,6 +292,9 @@ async function relayChat(localKey) {
     attemptsHeader: response.headers.get('x-local-relay-attempts'),
     providerHeader: decodeURIComponent(response.headers.get('x-local-relay-provider') || ''),
     text: body?.choices?.[0]?.message?.content || '',
+    errorType: body?.error?.type || '',
+    attempts: Array.isArray(body?.attempts) ? body.attempts : [],
+    diagnostics: Array.isArray(body?.diagnostics) ? body.diagnostics : [],
   }
 }
 
@@ -256,7 +312,11 @@ async function api(path, options = {}) {
 
 async function restoreRouting(routing) {
   const providerId = String(routing?.startProviderId || '')
-  const mode = routing?.startMode === 'locked' ? 'locked' : 'auto'
+  const mode = routing?.startMode === 'pinned'
+    ? 'pinned'
+    : routing?.startMode === 'locked'
+      ? 'locked'
+      : 'auto'
   if (!providerId) {
     await api('/api/routing/start', { method: 'POST', body: { providerId: '', mode } })
     return

@@ -34,6 +34,9 @@ if (!styleResponse.ok) throw new Error(`/assets/styles.css -> HTTP ${styleRespon
 const css = await styleResponse.text()
 const requiredCss = [
   'html[data-theme="dark"]',
+  'html[data-theme="dark"] .outbound-card',
+  'html[data-theme="dark"] .proxy-options .radio-label',
+  'html[data-theme="dark"] .proxy-options .radio-label:has(input:checked)',
   '.share-chart-layout',
   'grid-template-columns: minmax(190px, 226px) minmax(0, 1fr)',
   '.share-chart-legend',
@@ -46,6 +49,7 @@ console.log(JSON.stringify({
   systemThemeDetection: true,
   manualThemeMode: true,
   persistentPreference: true,
+  readableDarkProxyOptions: true,
   compactShareCharts: 3,
   externalLegends: 3,
 }, null, 2))

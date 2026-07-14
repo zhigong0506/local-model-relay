@@ -71,6 +71,66 @@ export async function testProvider(provider, model = null, serviceConfig = {}) {
   }
 }
 
+export async function codexCompatibilityTestProvider(provider, input = {}, serviceConfig = {}) {
+  const selectedCredential = selectCredential(provider, String(input.credentialId || ''))
+  const testProvider = selectedCredential ? { ...provider, activeCredentialId: selectedCredential.id } : provider
+  const availableModels = availableProviderModels(provider)
+  const selectedModel = normalizeText(input.model) || preferredRealTestModel(availableModels)
+  const timeoutMs = resolveTestTimeout(serviceConfig.providerRealTestTimeoutMs, 5000, 300000, 90000)
+  const startedAt = Date.now()
+
+  if (provider.authMode !== 'none' && !selectedCredential) {
+    return skippedCodexTest({ selectedModel, reason: 'no_credential', message: 'No enabled credential is available for this provider.' })
+  }
+  if (!availableModels.includes(selectedModel)) {
+    return skippedCodexTest({ selectedModel, reason: 'unsupported_model', message: 'The selected model is not in this provider supported model list.' })
+  }
+
+  const text = await sendCodexResponses(testProvider, selectedModel, {
+    model: selectedModel,
+    stream: true,
+    input: 'Reply with exactly: CODEX_TEXT_OK',
+    max_output_tokens: 16,
+  }, serviceConfig, timeoutMs)
+  const tool = text.ok ? await sendCodexResponses(testProvider, selectedModel, {
+    model: selectedModel,
+    stream: true,
+    input: 'Call diagnostic_ping with value ok.',
+    tools: [{
+      type: 'function',
+      name: 'diagnostic_ping',
+      description: 'Return a diagnostic pong.',
+      parameters: {
+        type: 'object',
+        properties: { value: { type: 'string' } },
+        required: ['value'],
+        additionalProperties: false,
+      },
+      strict: true,
+    }],
+    tool_choice: { type: 'function', name: 'diagnostic_ping' },
+  }, serviceConfig, timeoutMs) : skippedCodexTest({ selectedModel, reason: 'text_failed', message: 'Skipped tool-call check because text lifecycle failed.' })
+
+  const ok = text.ok && tool.ok
+  return {
+    ok,
+    status: ok ? 200 : tool.status || text.status || 0,
+    model: selectedModel,
+    credentialId: selectedCredential?.id || provider.activeCredentialId || '',
+    credentialLabel: selectedCredential?.label || '',
+    wireApi: provider.wireApi || 'chat',
+    latencyMs: Date.now() - startedAt,
+    timeoutMs,
+    checks: {
+      text: codexCheckSummary(text),
+      toolCall: codexCheckSummary(tool),
+    },
+    message: ok
+      ? 'Codex Responses text stream and forced function-call stream both passed.'
+      : tool.message || text.message || 'Codex compatibility test failed.',
+  }
+}
+
 export async function realTestProvider(provider, input = {}, serviceConfig = {}) {
   const selectedCredential = selectCredential(provider, String(input.credentialId || ''))
   const testProvider = selectedCredential
@@ -162,72 +222,120 @@ export async function realTestProvider(provider, input = {}, serviceConfig = {})
   }
 }
 
-export async function syncProviderCredentialUsage(provider, input = {}, serviceConfig = {}) {
-  const selectedCredential = selectCredential(provider, String(input.credentialId || ''))
-  if (!selectedCredential) {
-    return {
-      ok: false,
-      status: 0,
-      credentialId: '',
-      credentialLabel: '',
-      message: 'No credential is available.',
-    }
-  }
-
-  const testProvider = { ...provider, activeCredentialId: selectedCredential.id }
-  const startedAt = Date.now()
+async function sendCodexResponses(provider, model, body, serviceConfig, timeoutMs) {
   const controller = new AbortController()
-  const timeoutMs = resolveTestTimeout(serviceConfig.providerTestTimeoutMs, 3000, 120000, 30000)
   const timeout = setTimeout(() => controller.abort(), timeoutMs)
-
   try {
-    const response = await upstreamFetch(buildUserSelfUrl(provider.baseUrl), {
-      method: 'GET',
-      headers: buildAuthHeaders(testProvider),
+    const requestUrl = '/v1/responses'
+    const plan = buildWirePlan(requestUrl, provider)
+    const headers = buildAuthHeaders(provider)
+    headers.set('content-type', 'application/json')
+    const response = await upstreamFetch(buildWireUrl(provider.baseUrl, requestUrl, plan), {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(buildWireBody(body, { provider, model }, { collectUsage: false, collectStreamUsage: false }, plan)),
       signal: controller.signal,
-      proxyUrl: resolveProviderProxy(testProvider, serviceConfig).proxyUrl,
+      proxyUrl: resolveProviderProxy(provider, serviceConfig).proxyUrl,
     })
-    const text = await response.text()
-    const payload = parseJson(text)
-    const data = payload?.data && typeof payload.data === 'object' ? payload.data : payload
-    const snapshot = data && typeof data === 'object' ? {
-      group: data.group,
-      username: data.username ?? data.name ?? data.display_name,
-      quota: data.quota ?? data.remain_quota ?? data.remaining_quota,
-      used_quota: data.used_quota,
-      request_count: data.request_count,
-      status: data.status,
-    } : null
-    const hasSnapshotData = snapshot && Object.values(snapshot).some((value) => value !== undefined && value !== null && value !== '')
-
+    const contentType = response.headers.get('content-type') || ''
+    const parsed = contentType.includes('text/event-stream')
+      ? await readCodexSse(response, plan.upstreamApi)
+      : await readCodexJson(response, plan)
+    const needsTool = Array.isArray(body.tools) && body.tools.length > 0
+    const ok = response.ok && !parsed.errorMessage && (needsTool ? parsed.hasToolCall : parsed.hasText)
     return {
-      ok: response.ok && hasSnapshotData,
+      ok,
       status: response.status,
-      credentialId: selectedCredential.id,
-      credentialLabel: selectedCredential.label || '',
-      latencyMs: Date.now() - startedAt,
-      timeoutMs,
-      snapshot,
-      message: response.ok && hasSnapshotData ? 'ok' : preview(text || 'No upstream usage fields were returned.'),
+      hasText: parsed.hasText,
+      hasToolCall: parsed.hasToolCall,
+      eventTypes: parsed.eventTypes,
+      message: ok ? 'ok' : parsed.errorMessage || (needsTool ? 'No function call was returned.' : 'No text output was returned.'),
     }
   } catch (error) {
     const timedOut = controller.signal.aborted
     return {
       ok: false,
       status: 0,
-      credentialId: selectedCredential.id,
-      credentialLabel: selectedCredential.label || '',
-      latencyMs: Date.now() - startedAt,
-      timeoutMs,
-      snapshot: null,
-      reason: timedOut ? 'local_timeout' : 'network_error',
-      message: timedOut
-        ? `Local usage sync timed out after ${timeoutMs} ms before the upstream response was received.`
-        : error instanceof Error ? error.message : String(error),
+      hasText: false,
+      hasToolCall: false,
+      eventTypes: [],
+      message: timedOut ? `Codex compatibility check timed out after ${timeoutMs} ms.` : error instanceof Error ? error.message : String(error),
     }
   } finally {
     clearTimeout(timeout)
   }
+}
+
+async function readCodexJson(response, plan) {
+  const rawText = await response.text()
+  const payload = parseJson(rawText)
+  const transformed = payload ? transformResponsePayload(payload, plan) : null
+  return inspectCodexPayload(transformed || payload || {}, plan.incomingApi)
+}
+
+async function readCodexSse(response, upstreamApi) {
+  if (!response.body) return { hasText: false, hasToolCall: false, eventTypes: [], errorMessage: 'Upstream returned an empty stream.' }
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  const result = { hasText: false, hasToolCall: false, eventTypes: [], errorMessage: '' }
+  const consume = (data) => {
+    if (!data || data === '[DONE]') return
+    const payload = parseJson(data)
+    if (!payload) return
+    const inspected = inspectCodexPayload(payload, upstreamApi)
+    result.hasText ||= inspected.hasText
+    result.hasToolCall ||= inspected.hasToolCall
+    result.errorMessage ||= inspected.errorMessage
+    result.eventTypes.push(...inspected.eventTypes)
+  }
+  while (true) {
+    const { value, done } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    const lines = buffer.split(/\r?\n/)
+    buffer = lines.pop() || ''
+    for (const line of lines) {
+      const trimmed = line.trim()
+      if (trimmed.startsWith('data:')) consume(trimmed.slice(5).trim())
+    }
+  }
+  if (buffer.trim().startsWith('data:')) consume(buffer.trim().slice(5).trim())
+  return result
+}
+
+function inspectCodexPayload(payload, wireApi) {
+  const type = typeof payload?.type === 'string' ? payload.type : ''
+  const choice = Array.isArray(payload?.choices) ? payload.choices[0] : null
+  const responseOutput = Array.isArray(payload?.output) ? payload.output : []
+  return {
+    hasText: Boolean(
+      payload?.output_text || payload?.delta || choice?.delta?.content || choice?.message?.content ||
+      responseOutput.some((item) => item?.type === 'message' && Array.isArray(item.content) && item.content.some((part) => part?.text)),
+    ),
+    hasToolCall: Boolean(
+      type === 'response.function_call_arguments.delta' || type === 'response.function_call_arguments.done' ||
+      choice?.delta?.tool_calls?.length || choice?.message?.tool_calls?.length ||
+      responseOutput.some((item) => item?.type === 'function_call'),
+    ),
+    eventTypes: type ? [type] : [],
+    errorMessage: upstreamErrorMessage(payload),
+  }
+}
+
+function codexCheckSummary(result) {
+  return {
+    ok: Boolean(result?.ok),
+    status: Number(result?.status) || 0,
+    hasText: Boolean(result?.hasText),
+    hasToolCall: Boolean(result?.hasToolCall),
+    eventTypes: Array.isArray(result?.eventTypes) ? [...new Set(result.eventTypes)].slice(0, 20) : [],
+    message: result?.message || '',
+  }
+}
+
+function skippedCodexTest({ selectedModel = '', reason = '', message = '' } = {}) {
+  return { ok: false, skipped: true, status: 400, model: selectedModel, reason, message, checks: {} }
 }
 
 async function sendChatCompletion(provider, model, prompt, maxTokens, tokenField, wireApi, serviceConfig, timeoutMs) {
@@ -381,11 +489,6 @@ function resolveProviderProxy(provider, serviceConfig = {}) {
   })
 }
 
-function buildUserSelfUrl(baseUrl) {
-  const parsedBase = new URL(baseUrl)
-  return `${parsedBase.origin}/api/user/self`
-}
-
 export function previewRoute(config, stateStore, model) {
   const fakeRoute = config.routes.find((route) => route.enabled && route.virtualModel === model) || null
   return buildCandidates(config, fakeRoute, model, stateStore).map((candidate) => ({
@@ -394,6 +497,101 @@ export function previewRoute(config, stateStore, model) {
     model: candidate.model,
     priority: candidate.provider.priority,
   }))
+}
+
+export async function realTestRoute(config, stateStore, input = {}, serviceConfig = {}) {
+  const virtualModel = normalizeText(input.model)
+  const route = config.routes.find((item) => item.enabled && item.virtualModel === virtualModel) || null
+  const candidates = buildCandidates(config, route, virtualModel, stateStore)
+  const startedAt = Date.now()
+  const attempts = []
+
+  if (!virtualModel) {
+    return {
+      ok: false,
+      status: 400,
+      virtualModel: '',
+      model: '',
+      routedModel: '',
+      providerId: '',
+      providerName: '',
+      latencyMs: 0,
+      attempts,
+      message: 'A virtual model is required for route testing.',
+      reason: 'missing_model',
+    }
+  }
+
+  if (!candidates.length) {
+    return {
+      ok: false,
+      status: 503,
+      virtualModel,
+      model: virtualModel,
+      routedModel: '',
+      providerId: '',
+      providerName: '',
+      latencyMs: Date.now() - startedAt,
+      attempts,
+      message: 'No currently available provider route exists for this model.',
+      reason: 'no_available_provider',
+    }
+  }
+
+  let lastResult = null
+  for (const candidate of candidates.slice(0, Number(serviceConfig.maxAttempts) || candidates.length)) {
+    const result = await realTestProvider(candidate.provider, {
+      model: candidate.model,
+      prompt: input.prompt,
+      maxTokens: input.maxTokens,
+      wireApi: input.wireApi || candidate.provider.wireApi,
+    }, serviceConfig)
+    const attempt = {
+      providerId: candidate.provider.id,
+      providerName: candidate.provider.name,
+      model: candidate.model,
+      wireApi: result.wireApi || candidate.provider.wireApi || 'chat',
+      credentialId: result.credentialId || candidate.provider.activeCredentialId || '',
+      credentialLabel: result.credentialLabel || '',
+      status: result.status || 0,
+      ok: Boolean(result.ok),
+      skipped: Boolean(result.skipped),
+      reason: result.reason || '',
+      message: result.message || '',
+      latencyMs: Number(result.latencyMs) || 0,
+    }
+    attempts.push(attempt)
+    lastResult = { candidate, result, attempt }
+    if (result.ok) {
+      return {
+        ...result,
+        ok: true,
+        status: result.status || 200,
+        virtualModel,
+        routedModel: candidate.model,
+        providerId: candidate.provider.id,
+        providerName: candidate.provider.name,
+        latencyMs: Date.now() - startedAt,
+        attempts,
+        routeMatched: Boolean(route),
+      }
+    }
+  }
+
+  return {
+    ...(lastResult?.result || {}),
+    ok: false,
+    status: lastResult?.result?.status || 502,
+    virtualModel,
+    model: lastResult?.result?.model || virtualModel,
+    routedModel: lastResult?.candidate?.model || '',
+    providerId: lastResult?.candidate?.provider?.id || '',
+    providerName: lastResult?.candidate?.provider?.name || '',
+    latencyMs: Date.now() - startedAt,
+    attempts,
+    routeMatched: Boolean(route),
+    message: lastResult?.result?.message || 'Every available route target failed the real test.',
+  }
 }
 
 function buildAuthHeaders(provider) {
@@ -465,6 +663,8 @@ function clampInteger(value, min, max, fallback) {
 }
 
 function preferredRealTestModel(models) {
+  if (models.includes('gpt-5.6-luna')) return 'gpt-5.6-luna'
+  if (models.includes('gpt-5.4-mini')) return 'gpt-5.4-mini'
   return models.find((model) => /mini|flash|lite|small/i.test(model)) || models[0] || ''
 }
 

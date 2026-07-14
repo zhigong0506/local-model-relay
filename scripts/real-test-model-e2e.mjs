@@ -5,6 +5,8 @@ const stamp = Date.now()
 const firstModel = `real-test-primary-${stamp}`
 const selectedModel = `real-test-selected-${stamp}`
 const unsupportedModel = `real-test-unsupported-${stamp}`
+const preferredModel = 'gpt-5.6-luna'
+const fallbackModel = 'gpt-5.4-mini'
 const createdProviders = []
 const hits = []
 let server
@@ -17,6 +19,18 @@ try {
     body: { model: selectedModel, prompt: 'test selected model', maxTokens: 8 },
   })
   const hitsAfterValidTest = hits.length
+
+  const preferredProvider = await createProvider('preferred', [firstModel, fallbackModel, preferredModel])
+  const preferred = await api(`/api/providers/${preferredProvider.id}/real-test`, {
+    method: 'POST',
+    body: { prompt: 'test preferred default model', maxTokens: 8 },
+  })
+
+  const fallbackProvider = await createProvider('fallback', [firstModel, fallbackModel])
+  const fallback = await api(`/api/providers/${fallbackProvider.id}/real-test`, {
+    method: 'POST',
+    body: { prompt: 'test fallback default model', maxTokens: 8 },
+  })
 
   const unsupported = await api(`/api/providers/${configuredProvider.id}/real-test`, {
     method: 'POST',
@@ -39,13 +53,19 @@ try {
       hitsAfterValidTest === 1 &&
       hits[0]?.body?.model === selectedModel &&
       hits[0]?.body?.stream === true &&
+      preferred.ok === true &&
+      preferred.model === preferredModel &&
+      hits[1]?.body?.model === preferredModel &&
+      fallback.ok === true &&
+      fallback.model === fallbackModel &&
+      hits[2]?.body?.model === fallbackModel &&
       unsupported.ok === false &&
       unsupported.skipped === true &&
       unsupported.reason === 'unsupported_model' &&
       noModels.ok === false &&
       noModels.skipped === true &&
       noModels.reason === 'no_supported_models' &&
-      hits.length === 1,
+      hits.length === 3,
     selectedModel: {
       status: valid.status,
       model: valid.model,
@@ -53,6 +73,10 @@ try {
       testTimeoutMs: valid.timeoutMs,
       providerTimeoutMs: configuredProvider.timeoutMs,
       upstreamModel: hits[0]?.body?.model || '',
+    },
+    defaultModelOrder: {
+      preferred: preferred.model,
+      fallback: fallback.model,
     },
     unsupportedModel: {
       skipped: unsupported.skipped,
@@ -101,7 +125,9 @@ function startMockServer() {
     const body = text ? JSON.parse(text) : {}
     hits.push({ method: req.method, url: req.url, body })
 
-    await new Promise((resolve) => setTimeout(resolve, 5200))
+    if (body.model === selectedModel) {
+      await new Promise((resolve) => setTimeout(resolve, 5200))
+    }
 
     res.statusCode = 200
     if (body.stream) {

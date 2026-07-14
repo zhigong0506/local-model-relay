@@ -18,6 +18,8 @@ const requiredSnippets = [
   'setModelPickerOptions',
   'renderModelPicker',
   '匹配 ${visible.length} / ${picker.models.length} 个模型',
+  "models.includes('gpt-5.6-luna')",
+  "models.includes('gpt-5.4-mini')",
 ]
 const missing = requiredSnippets.filter((snippet) => !script.includes(snippet))
 if (missing.length) throw new Error(`Model picker script is missing: ${missing.join(', ')}`)
@@ -35,4 +37,5 @@ console.log(JSON.stringify({
   realTestSelectRemoved: true,
   searchablePickerScript: true,
   boundedScrollableList: true,
+  preferredTestModelOrder: ['gpt-5.6-luna', 'gpt-5.4-mini'],
 }, null, 2))

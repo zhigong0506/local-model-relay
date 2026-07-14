@@ -7,12 +7,18 @@ const expectedCodes = new Map([
   [403, 'upstream_permission_denied'],
   [408, 'upstream_request_timeout'],
   [409, 'upstream_request_conflict'],
+  [413, 'upstream_payload_too_large'],
   [425, 'upstream_overloaded'],
   [429, 'upstream_rate_limited'],
   [500, 'upstream_internal_error'],
   [502, 'upstream_gateway_error'],
   [503, 'upstream_unavailable'],
   [504, 'upstream_gateway_timeout'],
+  [520, 'upstream_web_server_unknown_error'],
+  [521, 'upstream_web_server_down'],
+  [522, 'upstream_origin_connection_timeout'],
+  [523, 'upstream_origin_unreachable'],
+  [524, 'upstream_origin_response_timeout'],
 ])
 
 for (const [status, code] of expectedCodes) {

@@ -13,7 +13,12 @@ const scenarios = [
   { name: 'E2E 02 503', status: 503, message: 'mock 503 from second provider' },
   { name: 'E2E 03 403', status: 403, message: 'mock 403 from third provider' },
   { name: 'E2E 04 402', status: 402, message: 'mock 402 from fourth provider' },
-  { name: 'E2E 05 OK', status: 200, message: 'FAILOVER_OK' },
+  { name: 'E2E 05 520', status: 520, message: 'mock 520 from fifth provider' },
+  { name: 'E2E 06 521', status: 521, message: 'mock 521 from sixth provider' },
+  { name: 'E2E 07 522', status: 522, message: 'mock 522 from seventh provider' },
+  { name: 'E2E 08 523', status: 523, message: 'mock 523 from eighth provider' },
+  { name: 'E2E 09 524', status: 524, message: 'mock 524 from ninth provider' },
+  { name: 'E2E 10 OK', status: 200, message: 'FAILOVER_OK' },
 ]
 
 const servers = await Promise.all(scenarios.map(startMockUpstream))

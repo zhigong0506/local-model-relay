@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { backupCorruptFile, readJsonFile, writeJsonFile } from './json-file.mjs'
 import { statePath } from './paths.mjs'
 import {
@@ -12,7 +13,7 @@ import {
 } from './usage.mjs'
 
 const EMPTY_STATE = {
-  version: 1,
+  version: 2,
   providerState: {},
   routing: {
     startProviderId: '',
@@ -22,11 +23,13 @@ const EMPTY_STATE = {
   requestLog: [],
   usage: createUsageState(),
   upstreamUsage: {},
+  sessionBindings: {},
   startedAt: null,
 }
 
 const DEFAULT_REQUEST_LOG_LIMIT = 1500
-const ROUTING_START_MODES = new Set(['auto', 'locked'])
+const DEFAULT_SESSION_LIMIT = 800
+const ROUTING_START_MODES = new Set(['auto', 'locked', 'pinned'])
 
 export class StateStore {
   constructor(filePath = statePath) {
@@ -40,12 +43,29 @@ export class StateStore {
     return structuredClone(this.state)
   }
 
+  getSummary() {
+    return structuredClone({
+      version: this.state.version,
+      providerState: this.state.providerState,
+      routing: this.state.routing,
+      usage: this.state.usage,
+      upstreamUsage: this.state.upstreamUsage,
+      startedAt: this.state.startedAt,
+      requestLogCount: this.state.requestLog.length,
+      sessionBindingCount: Object.keys(this.state.sessionBindings).length,
+    })
+  }
+
   getProviderState(providerId) {
     return this.ensureProvider(providerId)
   }
 
   getStartProviderId() {
     return this.state.routing?.startProviderId || ''
+  }
+
+  getRouting() {
+    return structuredClone(normalizeRouting(this.state.routing))
   }
 
   setStartProvider(providerId, mode) {
@@ -80,11 +100,70 @@ export class StateStore {
     const current = normalizeRouting(this.state.routing)
     this.state.routing = {
       startProviderId: '',
-      startMode: current.startMode,
+      startMode: current.startMode === 'pinned' ? 'auto' : current.startMode,
       updatedAt: new Date().toISOString(),
     }
     this.persist()
     return structuredClone(this.state.routing)
+  }
+
+  getSessionBinding(kind, opaqueId, now = Date.now()) {
+    const key = sessionStorageKey(kind, opaqueId)
+    if (!key) return null
+    const binding = this.state.sessionBindings[key]
+    if (!binding) return null
+    if (binding.expiresAt <= now) {
+      delete this.state.sessionBindings[key]
+      this.persist()
+      return null
+    }
+    binding.lastSeenAt = now
+    return structuredClone(binding)
+  }
+
+  setSessionBinding(kind, opaqueId, detail = {}, options = {}, now = Date.now()) {
+    const key = sessionStorageKey(kind, opaqueId)
+    const providerId = toText(detail.providerId)
+    if (!key || !providerId) return null
+    const ttlSeconds = clampPositiveInteger(options.ttlSeconds, 300, 604800, 86400)
+    const limit = clampPositiveInteger(options.limit, 50, 10000, DEFAULT_SESSION_LIMIT)
+    this.pruneSessionBindings(limit, now)
+    const previous = this.state.sessionBindings[key]
+    const binding = {
+      providerId,
+      model: toText(detail.model),
+      protocol: toText(detail.protocol),
+      source: toText(detail.source),
+      createdAt: previous?.createdAt || now,
+      lastSeenAt: now,
+      expiresAt: now + ttlSeconds * 1000,
+    }
+    this.state.sessionBindings[key] = binding
+    this.pruneSessionBindings(limit, now)
+    this.persist()
+    return this.state.sessionBindings[key] ? structuredClone(binding) : null
+  }
+
+  pruneSessionBindings(limit = DEFAULT_SESSION_LIMIT, now = Date.now()) {
+    const bindings = this.state.sessionBindings
+    let changed = false
+    for (const [key, binding] of Object.entries(bindings)) {
+      if (!binding || binding.expiresAt <= now) {
+        delete bindings[key]
+        changed = true
+      }
+    }
+    const keys = Object.keys(bindings)
+    if (keys.length > limit) {
+      keys
+        .sort((left, right) => (bindings[left]?.lastSeenAt || 0) - (bindings[right]?.lastSeenAt || 0))
+        .slice(0, keys.length - limit)
+        .forEach((key) => {
+          delete bindings[key]
+          changed = true
+        })
+    }
+    return changed
   }
 
   isCooling(providerId, now = Date.now()) {
@@ -274,9 +353,17 @@ export class StateStore {
       this.state.routing = {
         ...normalizeRouting(this.state.routing),
         startProviderId: '',
+        startMode: this.state.routing.startMode === 'pinned' ? 'auto' : this.state.routing.startMode,
         updatedAt: new Date().toISOString(),
       }
       changed = true
+    }
+
+    for (const [key, binding] of Object.entries(this.state.sessionBindings)) {
+      if (!keep.has(binding.providerId)) {
+        delete this.state.sessionBindings[key]
+        changed = true
+      }
     }
 
     if (changed) this.persist()
@@ -314,12 +401,13 @@ function normalizeState(value) {
   const requestLog = Array.isArray(value?.requestLog) ? value.requestLog.slice(0, DEFAULT_REQUEST_LOG_LIMIT) : []
   const rawUsage = value?.usage || { totals: emptyUsageBucket() }
   const state = {
-    version: 1,
+    version: 2,
     providerState: {},
     routing: normalizeRouting(value?.routing),
     requestLog,
     usage: createUsageState(rawUsage),
     upstreamUsage: normalizeUpstreamUsage(value?.upstreamUsage),
+    sessionBindings: normalizeSessionBindings(value?.sessionBindings),
     startedAt: typeof value?.startedAt === 'string' ? value.startedAt : null,
   }
   const hasUsageDimensions = [
@@ -465,6 +553,34 @@ function normalizeUpstreamUsage(value) {
     }
   }
   return out
+}
+
+function normalizeSessionBindings(value, now = Date.now()) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+  const bindings = {}
+  for (const [key, entry] of Object.entries(value)) {
+    if (!/^[a-f0-9]{64}$/i.test(key) || !entry || typeof entry !== 'object' || Array.isArray(entry)) continue
+    const providerId = toText(entry.providerId)
+    const expiresAt = toNumber(entry.expiresAt)
+    if (!providerId || expiresAt <= now) continue
+    bindings[key] = {
+      providerId,
+      model: toText(entry.model),
+      protocol: toText(entry.protocol),
+      source: toText(entry.source),
+      createdAt: toNumber(entry.createdAt) || now,
+      lastSeenAt: toNumber(entry.lastSeenAt) || now,
+      expiresAt,
+    }
+  }
+  return bindings
+}
+
+function sessionStorageKey(kind, opaqueId) {
+  const normalizedKind = toText(kind).toLowerCase()
+  const normalizedId = toText(opaqueId)
+  if (!normalizedKind || !normalizedId) return ''
+  return createHash('sha256').update(`${normalizedKind}\n${normalizedId}`).digest('hex')
 }
 
 function toText(value) {

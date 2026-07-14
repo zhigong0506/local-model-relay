@@ -10,7 +10,7 @@ import {
 import { configPath } from './paths.mjs'
 
 export const DEFAULT_CONFIG = {
-  version: 1,
+  version: 3,
   service: {
     enabled: true,
     listenHost: '127.0.0.1',
@@ -19,11 +19,14 @@ export const DEFAULT_CONFIG = {
     requestTimeoutMs: 90000,
     providerTestTimeoutMs: 30000,
     providerRealTestTimeoutMs: 90000,
-    retryStatusCodes: [401, 402, 403, 408, 409, 425, 429, 500, 502, 503, 504],
+    retryStatusCodes: [401, 402, 403, 408, 409, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524],
     maxAttempts: 8,
     defaultCooldownSeconds: 60,
     reconnectFailureThreshold: 4,
     reconnectCooldownSeconds: 600,
+    sessionAffinity: true,
+    sessionTtlSeconds: 86400,
+    sessionLimit: 800,
     logRequests: true,
     collectUsage: true,
     collectStreamUsage: true,
@@ -31,7 +34,33 @@ export const DEFAULT_CONFIG = {
     requestLogLimit: 1500,
     outboundProxyMode: 'direct',
     outboundProxyUrl: '',
+    // Off by default so existing routes remain backward compatible until their
+    // providers have been explicitly verified with a real Codex Responses test.
+    capabilityRouting: false,
+    diagnosticsLlm: {
+      enabled: false,
+      baseUrl: '',
+      apiKey: '',
+      model: '',
+      timeoutMs: 30000,
+    },
   },
+  providerGroups: [
+    {
+      id: 'openai',
+      name: 'OpenAI',
+      description: 'OpenAI 与 OpenAI-compatible 中转线路',
+      color: '#7567d8',
+      priority: 10,
+    },
+    {
+      id: 'deepseek',
+      name: 'DeepSeek',
+      description: 'DeepSeek 模型与兼容中转线路',
+      color: '#159a80',
+      priority: 20,
+    },
+  ],
   providers: [],
   routes: [],
   updatedAt: null,
@@ -60,6 +89,9 @@ export class ConfigStore {
     if (isMaskedProxyUrl(nextPatch.outboundProxyUrl)) {
       nextPatch.outboundProxyUrl = this.config.service.outboundProxyUrl
     }
+    if (isRecord(nextPatch.diagnosticsLlm)) {
+      nextPatch.diagnosticsLlm = preserveDiagnosticsLlm(nextPatch.diagnosticsLlm, this.config.service.diagnosticsLlm)
+    }
     assertServicePatch(nextPatch)
     this.config.service = normalizeService({ ...this.config.service, ...nextPatch })
     this.touch()
@@ -79,6 +111,7 @@ export class ConfigStore {
     if (!includeSecrets) {
       config.service.localApiKey = maskSecret(config.service.localApiKey)
       config.service.outboundProxyUrl = maskProxyUrl(config.service.outboundProxyUrl)
+      config.service.diagnosticsLlm = publicDiagnosticsLlm(config.service.diagnosticsLlm)
       config.providers = config.providers.map((provider) => ({
         ...provider,
         apiKey: maskSecret(resolveActiveKey(provider)),
@@ -92,7 +125,7 @@ export class ConfigStore {
 
     return {
       app: 'local-model-relay',
-      version: 1,
+      version: 3,
       exportedAt: new Date().toISOString(),
       includesSecrets: Boolean(includeSecrets),
       config,
@@ -111,6 +144,10 @@ export class ConfigStore {
     if (isMaskedProxyUrl(payload.service.outboundProxyUrl)) {
       payload.service.outboundProxyUrl = this.config.service.outboundProxyUrl
     }
+    payload.service.diagnosticsLlm = preserveDiagnosticsLlm(
+      payload.service.diagnosticsLlm,
+      this.config.service.diagnosticsLlm,
+    )
 
     if (Array.isArray(payload.providers)) {
       payload.providers = payload.providers.map((provider) => {
@@ -144,15 +181,59 @@ export class ConfigStore {
     return publicProvider(provider)
   }
 
-  updateCredentialMetadata(providerId, credentialId, patch = {}) {
+  createProviderGroup(input) {
+    const name = toText(input?.name, '')
+    if (!name) throw new HttpError(400, 'invalid_provider_group', 'Provider group name is required.')
+    assertUniqueProviderGroupName(this.config.providerGroups, name)
+    const group = normalizeProviderGroup({
+      ...input,
+      id: randomUUID(),
+      priority: nextProviderGroupPriority(this.config.providerGroups),
+      name,
+    })
+    this.config.providerGroups.push(group)
+    this.touch()
+    this.persist()
+    return structuredClone(group)
+  }
+
+  updateProviderGroup(id, input) {
+    const index = this.config.providerGroups.findIndex((group) => group.id === id)
+    if (index < 0) throw new HttpError(404, 'provider_group_not_found', 'Provider group not found.')
+
+    const existing = this.config.providerGroups[index]
+    const name = input?.name === undefined ? existing.name : toText(input.name, '')
+    if (!name) throw new HttpError(400, 'invalid_provider_group', 'Provider group name is required.')
+    assertUniqueProviderGroupName(this.config.providerGroups, name, id)
+    const next = normalizeProviderGroup({ ...existing, ...input, id, name })
+    this.config.providerGroups[index] = next
+    this.touch()
+    this.persist()
+    return structuredClone(next)
+  }
+
+  deleteProviderGroup(id) {
+    const group = this.config.providerGroups.find((item) => item.id === id)
+    if (!group) throw new HttpError(404, 'provider_group_not_found', 'Provider group not found.')
+    if (this.config.providerGroups.length <= 1) {
+      throw new HttpError(409, 'last_provider_group', 'At least one provider group must be kept.')
+    }
+    const providerCount = this.config.providers.filter((provider) => provider.groupId === id).length
+    if (providerCount > 0) {
+      throw new HttpError(409, 'provider_group_not_empty', `Move the ${providerCount} provider(s) in this group before deleting it.`)
+    }
+
+    this.config.providerGroups = this.config.providerGroups.filter((item) => item.id !== id)
+    this.touch()
+    this.persist()
+    return this.getPublic()
+  }
+
+  updateProviderCapabilities(providerId, capabilities = {}) {
     const provider = this.config.providers.find((item) => item.id === providerId)
     if (!provider) throw new HttpError(404, 'provider_not_found', 'Provider not found.')
 
-    const credential = provider.credentials.find((item) => item.id === credentialId)
-    if (!credential) throw new HttpError(404, 'credential_not_found', 'Credential not found.')
-
-    if (patch.upstreamGroup !== undefined) credential.upstreamGroup = toText(patch.upstreamGroup, '')
-    if (patch.upstreamStatus !== undefined) credential.upstreamStatus = toText(patch.upstreamStatus, '')
+    provider.capabilities = normalizeCapabilities(capabilities)
     provider.updatedAt = new Date().toISOString()
     this.touch()
     this.persist()
@@ -160,6 +241,7 @@ export class ConfigStore {
   }
 
   createProvider(input) {
+    const groupId = resolveProviderGroupId(input?.groupId, this.config.providerGroups, true)
     const rawProvider = {
       id: randomUUID(),
       enabled: true,
@@ -173,7 +255,9 @@ export class ConfigStore {
       models: [],
       tags: [],
       notes: '',
+      capabilities: {},
       ...input,
+      groupId,
     }
     assertProviderPatch(rawProvider)
     const provider = normalizeProvider(rawProvider)
@@ -190,7 +274,12 @@ export class ConfigStore {
     if (index < 0) throw new HttpError(404, 'provider_not_found', 'Provider not found.')
 
     const existing = this.config.providers[index]
-    const preservedInput = preserveProviderSecrets(input, existing)
+    const preservedInput = preserveProviderSecrets({
+      ...input,
+      groupId: input?.groupId === undefined
+        ? existing.groupId
+        : resolveProviderGroupId(input.groupId, this.config.providerGroups, true),
+    }, existing)
     assertProviderPatch(preservedInput)
     const next = normalizeProvider({
       ...existing,
@@ -307,9 +396,21 @@ export function publicConfig(config) {
 }
 
 function publicService(service) {
+  const clone = structuredClone(service)
   return {
-    ...structuredClone(service),
+    ...clone,
     outboundProxyUrl: maskProxyUrl(service.outboundProxyUrl),
+    diagnosticsLlm: publicDiagnosticsLlm(service.diagnosticsLlm),
+  }
+}
+
+function publicDiagnosticsLlm(value) {
+  const diagnosticsLlm = normalizeDiagnosticsLlm(value)
+  return {
+    ...diagnosticsLlm,
+    apiKey: '',
+    apiKeySet: Boolean(diagnosticsLlm.apiKey),
+    apiKeyMasked: maskSecret(diagnosticsLlm.apiKey),
   }
 }
 
@@ -407,12 +508,22 @@ export function resolveActiveCredential(provider) {
 
 function normalizeConfig(value) {
   if (!isRecord(value)) throw new Error('config must be an object')
+  const providerGroups = normalizeProviderGroups(value.providerGroups)
+  const groupIds = new Set(providerGroups.map((group) => group.id))
+  const fallbackGroupId = groupIds.has('openai') ? 'openai' : providerGroups[0].id
+  const providers = Array.isArray(value.providers)
+    ? value.providers.map((provider) => normalizeProvider({
+      ...provider,
+      groupId: groupIds.has(toText(provider?.groupId, '')) ? provider.groupId : fallbackGroupId,
+    }))
+    : []
   const config = {
-    version: 1,
+    version: 3,
     service: normalizeService({ ...DEFAULT_CONFIG.service, ...value.service }),
-    providers: Array.isArray(value.providers) ? value.providers.map(normalizeProvider) : [],
+    providerGroups,
+    providers,
     routes: Array.isArray(value.routes)
-      ? value.routes.map((route) => normalizeRoute(route, Array.isArray(value.providers) ? value.providers : []))
+      ? value.routes.map((route) => normalizeRoute(route, providers))
       : [],
     updatedAt: typeof value.updatedAt === 'string' ? value.updatedAt : null,
   }
@@ -452,8 +563,21 @@ function normalizeService(input) {
     10800,
     DEFAULT_CONFIG.service.reconnectCooldownSeconds,
   )
+  const sessionTtlSeconds = clampInteger(
+    input.sessionTtlSeconds,
+    300,
+    604800,
+    DEFAULT_CONFIG.service.sessionTtlSeconds,
+  )
+  const sessionLimit = clampInteger(
+    input.sessionLimit,
+    50,
+    10000,
+    DEFAULT_CONFIG.service.sessionLimit,
+  )
   const outboundProxyMode = normalizeOutboundProxyMode(input.outboundProxyMode)
   const outboundProxyUrl = normalizeProxyUrl(input.outboundProxyUrl)
+  const diagnosticsLlm = normalizeDiagnosticsLlm(input.diagnosticsLlm)
 
   return {
     enabled: input.enabled !== false,
@@ -468,6 +592,9 @@ function normalizeService(input) {
     defaultCooldownSeconds,
     reconnectFailureThreshold,
     reconnectCooldownSeconds,
+    sessionAffinity: input.sessionAffinity !== false,
+    sessionTtlSeconds,
+    sessionLimit,
     logRequests: input.logRequests !== false,
     collectUsage: input.collectUsage !== false,
     collectStreamUsage: input.collectStreamUsage !== false,
@@ -475,6 +602,8 @@ function normalizeService(input) {
     requestLogLimit: clampInteger(input.requestLogLimit, 200, 3000, DEFAULT_CONFIG.service.requestLogLimit),
     outboundProxyMode: outboundProxyMode === 'custom' && !outboundProxyUrl ? 'direct' : outboundProxyMode,
     outboundProxyUrl,
+    capabilityRouting: input.capabilityRouting === true,
+    diagnosticsLlm,
   }
 }
 
@@ -483,6 +612,35 @@ function assertServicePatch(patch) {
   if (mode === 'custom' && !normalizeProxyUrl(patch.outboundProxyUrl)) {
     throw new HttpError(400, 'invalid_service', 'Custom outbound proxy URL must start with http:// or https://.')
   }
+  if (isRecord(patch.diagnosticsLlm)) {
+    const baseUrl = toText(patch.diagnosticsLlm.baseUrl, '')
+    if (baseUrl && !isHttpUrl(baseUrl)) {
+      throw new HttpError(400, 'invalid_diagnostics_llm', 'AI diagnostics URL must start with http:// or https://.')
+    }
+  }
+}
+
+function normalizeDiagnosticsLlm(input) {
+  const value = isRecord(input) ? input : {}
+  const baseUrl = toText(value.baseUrl, '')
+  return {
+    enabled: value.enabled === true,
+    baseUrl: isHttpUrl(baseUrl) ? trimTrailingSlash(baseUrl) : '',
+    apiKey: typeof value.apiKey === 'string' ? value.apiKey.trim() : '',
+    model: toText(value.model, ''),
+    timeoutMs: clampInteger(value.timeoutMs, 5000, 120000, DEFAULT_CONFIG.service.diagnosticsLlm.timeoutMs),
+  }
+}
+
+function preserveDiagnosticsLlm(input, existing) {
+  const next = isRecord(input) ? { ...input } : {}
+  if (next.clearApiKey === true) {
+    next.apiKey = ''
+  } else if (isMaskedOrEmpty(next.apiKey)) {
+    next.apiKey = existing?.apiKey || ''
+  }
+  delete next.clearApiKey
+  return next
 }
 
 function assertProviderPatch(patch) {
@@ -516,6 +674,7 @@ function normalizeProvider(input) {
 
   return {
     id: toText(input.id, randomUUID()),
+    groupId: toText(input.groupId, 'openai'),
     name,
     baseUrl: trimTrailingSlash(baseUrl),
     apiKey: resolveActiveKey({ credentials, activeCredentialId }),
@@ -525,6 +684,7 @@ function normalizeProvider(input) {
     wireApi,
     outboundProxyMode: outboundProxyMode === 'custom' && !outboundProxyUrl ? 'inherit' : outboundProxyMode,
     outboundProxyUrl,
+    capabilities: normalizeCapabilities(input.capabilities),
     enabled: input.enabled !== false,
     priority: toNonNegativeInteger(input.priority, 100),
     timeoutMs: clampInteger(input.timeoutMs, 5000, 300000, DEFAULT_CONFIG.service.requestTimeoutMs),
@@ -535,6 +695,64 @@ function normalizeProvider(input) {
     createdAt: typeof input.createdAt === 'string' ? input.createdAt : new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   }
+}
+
+function normalizeProviderGroups(value) {
+  const source = Array.isArray(value) && value.length > 0
+    ? value
+    : DEFAULT_CONFIG.providerGroups
+  const groups = []
+  const seenIds = new Set()
+  const seenNames = new Set()
+
+  for (const item of source) {
+    if (!isRecord(item)) continue
+    const group = normalizeProviderGroup(item)
+    const nameKey = group.name.toLocaleLowerCase()
+    if (seenIds.has(group.id) || seenNames.has(nameKey)) continue
+    seenIds.add(group.id)
+    seenNames.add(nameKey)
+    groups.push(group)
+  }
+
+  if (groups.length === 0) return DEFAULT_CONFIG.providerGroups.map(normalizeProviderGroup)
+  return groups.sort((a, b) => a.priority - b.priority || a.name.localeCompare(b.name))
+}
+
+function normalizeProviderGroup(input) {
+  return {
+    id: toText(input.id, randomUUID()),
+    name: toText(input.name, '未命名分组'),
+    description: typeof input.description === 'string' ? input.description.trim().slice(0, 240) : '',
+    color: normalizeProviderGroupColor(input.color),
+    priority: toNonNegativeInteger(input.priority, 100),
+    createdAt: typeof input.createdAt === 'string' ? input.createdAt : new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  }
+}
+
+function normalizeProviderGroupColor(value) {
+  const color = typeof value === 'string' ? value.trim().toLowerCase() : ''
+  return /^#[0-9a-f]{6}$/i.test(color) ? color : '#667085'
+}
+
+function resolveProviderGroupId(value, groups, strict = false) {
+  const requested = toText(value, '')
+  if (requested && groups.some((group) => group.id === requested)) return requested
+  if (strict && requested) throw new HttpError(400, 'invalid_provider_group', 'Selected provider group does not exist.')
+  return groups.find((group) => group.id === 'openai')?.id || groups[0]?.id || 'openai'
+}
+
+function assertUniqueProviderGroupName(groups, name, exceptId = '') {
+  const normalized = name.trim().toLocaleLowerCase()
+  if (groups.some((group) => group.id !== exceptId && group.name.trim().toLocaleLowerCase() === normalized)) {
+    throw new HttpError(409, 'duplicate_provider_group', `A provider group named "${name}" already exists.`)
+  }
+}
+
+function nextProviderGroupPriority(groups) {
+  if (!groups.length) return 10
+  return Math.max(...groups.map((group) => Number(group.priority) || 0)) + 10
 }
 
 function normalizeCredentials(input) {
@@ -700,6 +918,26 @@ function normalizeStatusCodes(value) {
     .filter((code) => Number.isInteger(code) && code >= 400 && code <= 599)
 
   return [...new Set(codes.length > 0 ? codes : DEFAULT_CONFIG.service.retryStatusCodes)]
+}
+
+function normalizeCapabilities(value) {
+  if (!isRecord(value)) return {}
+  const codex = isRecord(value.codex) ? value.codex : null
+  if (!codex) return {}
+  const rawModels = isRecord(codex.models) ? codex.models : {}
+  const models = {}
+  for (const [model, result] of Object.entries(rawModels)) {
+    if (!isRecord(result) || !model.trim()) continue
+    models[model.trim()] = {
+      status: ['verified', 'failed', 'unknown'].includes(result.status) ? result.status : 'unknown',
+      checkedAt: typeof result.checkedAt === 'string' ? result.checkedAt : null,
+      credentialId: toText(result.credentialId, ''),
+      wireApi: toText(result.wireApi, 'responses'),
+      message: toText(result.message, ''),
+      checks: isRecord(result.checks) ? structuredClone(result.checks) : {},
+    }
+  }
+  return { codex: { models } }
 }
 
 function normalizeStringList(value) {

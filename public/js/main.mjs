@@ -1,9 +1,15 @@
+const CLIENT_RUNTIME_PROTOCOL = 1
+const FULL_STATE_TABS = new Set(['dashboard', 'records', 'logs'])
+
 const state = {
   config: null,
   runtime: null,
   editingProvider: null,
+  editingProviderGroup: null,
+  activeProviderGroupId: localStorage.getItem('local-model-relay-provider-group') || 'openai',
   editingRoute: null,
   testingProvider: null,
+  testingRoute: null,
   draggingProviderId: null,
   providerDragSaved: false,
   draggingTargetRow: null,
@@ -20,6 +26,10 @@ const state = {
   dashboardRange: '7d',
   dashboardGranularity: 'day',
   themeMode: document.documentElement.dataset.themeMode || 'system',
+  selectedErrorDetail: '',
+  selectedErrorLog: null,
+  aiDiagnosis: null,
+  clearDiagnosticsLlmKey: false,
   recordsFilter: {
     search: '',
     status: 'all',
@@ -55,6 +65,10 @@ function bindTabs() {
       $$('.panel').forEach((panel) => panel.classList.remove('active'))
       $(`#${button.dataset.tab}Panel`).classList.add('active')
       state.activeTab = button.dataset.tab
+      if (FULL_STATE_TABS.has(state.activeTab)) {
+        void refreshState({ forceFull: true })
+        return
+      }
       if (state.activeTab === 'dashboard') nextFrame().then(renderDashboard)
       if (state.activeTab === 'speed') renderSpeedTestIdle()
       if (state.activeTab === 'records') renderRecords()
@@ -66,10 +80,17 @@ function bindTabs() {
 
 function bindActions() {
   $('#refreshBtn').addEventListener('click', refreshAll)
+  $('#runtimeCheckBtn').addEventListener('click', refreshAll)
   $('#copyBaseUrlBtn').addEventListener('click', copyBaseUrl)
   $('#serviceToggle').addEventListener('change', toggleService)
-  $('#newProviderBtn').addEventListener('click', () => openProviderDialog())
-  $('#quickProviderBtn').addEventListener('click', () => openProviderDialog())
+  $('#newProviderBtn').addEventListener('click', () => openProviderDialog(null, preferredNewProviderGroupId()))
+  $('#quickProviderBtn').addEventListener('click', () => openProviderDialog(null, preferredNewProviderGroupId()))
+  $('#manageProviderGroupsBtn').addEventListener('click', openProviderGroupsDialog)
+  $('#providerGroupTabs').addEventListener('click', handleProviderGroupTabClick)
+  $('#providerGroupRows').addEventListener('click', handleProviderGroupAction)
+  $('#providerGroupForm').addEventListener('submit', saveProviderGroup)
+  $('#resetProviderGroupFormBtn').addEventListener('click', resetProviderGroupForm)
+  $('#deleteProviderBtn').addEventListener('click', deleteProviderFromEditor)
   $('#routingStartMode').addEventListener('change', saveRoutingMode)
   $('#clearStartProviderBtn').addEventListener('click', clearStartProvider)
   formField($('#providerForm'), 'providerOutboundProxyMode').addEventListener('change', renderProviderProxyFields)
@@ -77,6 +98,8 @@ function bindActions() {
   $('#newRouteBtn').addEventListener('click', () => openRouteDialog())
   $('#providerForm').addEventListener('submit', saveProvider)
   $('#realTestForm').addEventListener('submit', runRealTest)
+  $('#runCodexTestBtn').addEventListener('click', () => runCodexCompatibilityTestForForm($('#realTestForm')))
+  $('#routeTestForm').addEventListener('submit', runRouteTest)
   $('#routeForm').addEventListener('submit', saveRoute)
   bindTargetDragSort()
   $('#settingsForm').addEventListener('submit', saveSettings)
@@ -89,6 +112,7 @@ function bindActions() {
   $$('[name="outboundProxyMode"]', $('#settingsForm')).forEach((input) => {
     input.addEventListener('change', renderOutboundProxyFields)
   })
+  formField($('#settingsForm'), 'sessionAffinity').addEventListener('change', renderSessionAffinityFields)
   $('#addTargetBtn').addEventListener('click', () => addTargetRow())
   $('#addCredentialBtn').addEventListener('click', () => addCredentialRow())
   $('#exitBtn').addEventListener('click', exitProcess)
@@ -117,12 +141,23 @@ function bindActions() {
   $('#logPageSize').addEventListener('change', handleLogPageSizeChange)
   $('#logPrevPage').addEventListener('click', () => changeLogsPage(-1))
   $('#logNextPage').addEventListener('click', () => changeLogsPage(1))
+  $('#copyErrorDetailBtn').addEventListener('click', copyErrorDetail)
+  $('#runAiDiagnosisBtn').addEventListener('click', runAiDiagnosis)
+  $('#copyAiDiagnosisBtn').addEventListener('click', copyAiDiagnosis)
   $('#exportRecordsCsvBtn').addEventListener('click', exportRecordsCsv)
   $('#exportConfigBtn').addEventListener('click', exportConfig)
   $('#importConfigBtn').addEventListener('click', () => $('#importConfigFile').click())
   $('#importConfigFile').addEventListener('change', importConfig)
   $('#toggleLocalKeyBtn').addEventListener('click', toggleLocalKeyVisibility)
+  $('#toggleDiagnosticsKeyBtn').addEventListener('click', toggleDiagnosticsKeyVisibility)
+  $('#clearDiagnosticsKeyBtn').addEventListener('click', clearDiagnosticsKey)
+  $('#testDiagnosticsLlmBtn').addEventListener('click', testDiagnosticsLlm)
+  formField($('#settingsForm'), 'diagnosticsLlmApiKey').addEventListener('input', () => {
+    state.clearDiagnosticsLlmKey = false
+    updateDiagnosticsKeyStatus()
+  })
   $$('.close-dialog').forEach((button) => button.addEventListener('click', () => button.closest('dialog').close()))
+  document.addEventListener('click', handleErrorDetailAction)
   document.addEventListener('click', closeModelPickersOnOutsideClick)
   document.addEventListener('keydown', closeModelPickersOnEscape)
 }
@@ -186,14 +221,21 @@ function syncChartTheme() {
 }
 
 async function refreshAll() {
-  state.config = await api('/api/config')
-  state.runtime = await api('/api/state')
+  const [config, runtime] = await Promise.all([
+    api('/api/config'),
+    api('/api/state'),
+  ])
+  state.config = config
+  state.runtime = runtime
   render()
 }
 
-async function refreshState() {
+async function refreshState(options = {}) {
   try {
-    state.runtime = await api('/api/state')
+    const forceFull = Boolean(options.forceFull) || FULL_STATE_TABS.has(state.activeTab)
+    state.runtime = forceFull
+      ? await api('/api/state', { silent: Boolean(options.silent) })
+      : await fetchRuntimeSummary()
     renderStatus()
     renderOutboundStatus()
     renderRoutingBar()
@@ -202,12 +244,29 @@ async function refreshState() {
     renderDashboard()
     renderRecords()
     renderLogs()
+    renderRuntimeNotice()
   } catch {
     // Server may be restarting.
   }
 }
 
+async function fetchRuntimeSummary() {
+  try {
+    const summary = await api('/api/state/summary', { silent: true })
+    return {
+      ...(state.runtime || {}),
+      ...summary,
+      requestLog: state.runtime?.requestLog || [],
+      sessionBindings: state.runtime?.sessionBindings || {},
+    }
+  } catch (error) {
+    if (error?.status !== 404) throw error
+    return api('/api/state', { silent: true })
+  }
+}
+
 function render() {
+  renderRuntimeNotice()
   renderStatus()
   renderSettings()
   renderSpeedProxyField()
@@ -218,6 +277,27 @@ function render() {
   renderDashboard()
   renderRecords()
   renderLogs()
+}
+
+function renderRuntimeNotice() {
+  const notice = $('#runtimeNotice')
+  if (!notice) return
+
+  const meta = state.runtime?.runtimeMeta
+  let title = ''
+  let message = ''
+  if (!meta || Number(meta.protocolVersion) !== CLIENT_RUNTIME_PROTOCOL) {
+    title = '页面与后台版本不一致'
+    message = '当前后台进程仍是旧版本，请关闭并重新启动 Local Model Relay。'
+  } else if (meta.restartRequired) {
+    title = '后台代码已更新'
+    message = '请重新启动 Local Model Relay，让本次修改完整生效。'
+  }
+
+  notice.hidden = !title
+  if (!title) return
+  $('#runtimeNoticeTitle').textContent = title
+  $('#runtimeNoticeText').textContent = message
 }
 
 function renderSpeedProxyField() {
@@ -343,7 +423,7 @@ function speedSummaryHtml(summary = null, totalRounds = 0) {
 }
 
 function preferredSpeedModel(models = []) {
-  return models.find((model) => /mini|flash|lite|small/i.test(model)) || models[0] || ''
+  return preferredTestModel(models)
 }
 
 function renderStatus() {
@@ -373,6 +453,21 @@ function renderSettings() {
   formField(form, 'defaultCooldownSeconds').value = service.defaultCooldownSeconds
   formField(form, 'reconnectFailureThreshold').value = service.reconnectFailureThreshold || 4
   formField(form, 'reconnectCooldownSeconds').value = service.reconnectCooldownSeconds || 600
+  formField(form, 'sessionAffinity').checked = service.sessionAffinity !== false
+  formField(form, 'capabilityRouting').checked = service.capabilityRouting === true
+  formField(form, 'sessionTtlSeconds').value = service.sessionTtlSeconds || 86400
+  formField(form, 'sessionLimit').value = service.sessionLimit || 800
+  const diagnosticsLlm = service.diagnosticsLlm || {}
+  formField(form, 'diagnosticsLlmEnabled').checked = diagnosticsLlm.enabled === true
+  formField(form, 'diagnosticsLlmBaseUrl').value = diagnosticsLlm.baseUrl || ''
+  formField(form, 'diagnosticsLlmModel').value = diagnosticsLlm.model || ''
+  formField(form, 'diagnosticsLlmApiKey').value = ''
+  formField(form, 'diagnosticsLlmTimeoutSeconds').value = Math.round((diagnosticsLlm.timeoutMs || 30000) / 1000)
+  state.clearDiagnosticsLlmKey = false
+  updateDiagnosticsKeyStatus()
+  $('#diagnosticsLlmStatus').textContent = diagnosticsLlm.enabled
+    ? '已启用；错误详情中可以按需调用。'
+    : '已关闭；保存后才会启用。'
   formField(form, 'retryStatusCodes').value = service.retryStatusCodes.join(', ')
   formField(form, 'logRequests').checked = service.logRequests
   formField(form, 'collectUsage').checked = service.collectUsage
@@ -384,6 +479,7 @@ function renderSettings() {
   })
   formField(form, 'outboundProxyUrl').value = service.outboundProxyUrl || ''
   renderOutboundProxyFields()
+  renderSessionAffinityFields()
   renderOutboundStatus()
 }
 
@@ -391,6 +487,13 @@ function renderOutboundProxyFields() {
   const form = $('#settingsForm')
   const mode = formField(form, 'outboundProxyMode').value || 'direct'
   $('#customProxyField').hidden = mode !== 'custom'
+}
+
+function renderSessionAffinityFields() {
+  const form = $('#settingsForm')
+  const enabled = formField(form, 'sessionAffinity').checked
+  formField(form, 'sessionTtlSeconds').disabled = !enabled
+  formField(form, 'sessionLimit').disabled = !enabled
 }
 
 function renderOutboundStatus() {
@@ -403,42 +506,90 @@ function renderOutboundStatus() {
 
 function renderRoutingBar() {
   const routing = state.runtime?.routing || {}
-  const mode = routing.startMode === 'locked' ? 'locked' : 'auto'
+  const mode = ['auto', 'locked', 'pinned'].includes(routing.startMode) ? routing.startMode : 'auto'
   const provider = (state.config?.providers || []).find((item) => item.id === routing.startProviderId)
   const modeLabel = routingModeLabel(mode)
 
   $('#routingStartMode').value = mode
+  $('#routingBar').classList.toggle('pinned', mode === 'pinned')
   $('#routingStartName').textContent = provider
     ? provider.name
     : routing.startProviderId
       ? '起点线路已失效'
       : '默认优先级'
   $('#routingStartHint').textContent = provider
-    ? `${modeLabel} · 请求会从这条线路开始`
+    ? mode === 'pinned'
+      ? `${modeLabel} · 只会使用这条线路，失败直接返回`
+      : mode === 'locked'
+        ? `${modeLabel} · 请求从这条线路开始，失败仍会故障转移`
+        : `${modeLabel} · 请求从这条线路开始，成功后自动推进起点`
     : routing.startProviderId
       ? `${modeLabel} · 当前候选中找不到这条线路`
-      : `${modeLabel} · 未指定起点时按优先级从头开始`
+      : mode === 'pinned'
+        ? `${modeLabel} · 请先在线路列表中设定起点`
+        : `${modeLabel} · 未指定起点时按优先级从头开始`
   $('#clearStartProviderBtn').disabled = !routing.startProviderId
 }
 
 function renderProviders() {
   if (state.draggingProviderId) return
   const rows = $('#providerRows')
-  const providers = [...state.config.providers].sort((a, b) => a.priority - b.priority)
+  const groups = providerGroups()
+  const allProviders = [...state.config.providers].sort((a, b) => a.priority - b.priority)
+  const validGroupIds = new Set(['all', ...groups.map((group) => group.id)])
+  if (!validGroupIds.has(state.activeProviderGroupId)) {
+    state.activeProviderGroupId = groups.find((group) => group.id === 'openai')?.id || groups[0]?.id || 'all'
+    localStorage.setItem('local-model-relay-provider-group', state.activeProviderGroupId)
+  }
+  const providers = state.activeProviderGroupId === 'all'
+    ? allProviders
+    : allProviders.filter((provider) => providerGroupId(provider) === state.activeProviderGroupId)
   const startProviderId = state.runtime?.routing?.startProviderId || ''
-  $('#providerEmptyGuide').hidden = providers.length > 0
-  rows.innerHTML = providers.length ? '' : `<tr><td colspan="9" class="empty">还没有线路，先新增一个中转站。</td></tr>`
+  renderProviderGroupTabs(groups, allProviders)
+  $('#providerEmptyGuide').hidden = allProviders.length > 0
+  if (providers.length) {
+    rows.innerHTML = ''
+  } else {
+    const group = groups.find((item) => item.id === state.activeProviderGroupId)
+    const message = allProviders.length === 0
+      ? '还没有线路，先新增一个中转站。'
+      : `「${group?.name || '当前'}」分组还没有线路。`
+    rows.innerHTML = `
+      <tr>
+        <td colspan="9" class="empty provider-group-empty">
+          <span>${escapeHtml(message)}</span>
+          <button class="ghost" type="button" data-action="new-provider">在此分组新增线路</button>
+        </td>
+      </tr>
+    `
+  }
 
   for (const provider of providers) {
     const entry = state.runtime.providerState[provider.id] || {}
     const isStartProvider = provider.id === startProviderId
+    const group = groups.find((item) => item.id === providerGroupId(provider))
     const tr = document.createElement('tr')
     tr.dataset.providerId = provider.id
+    tr.dataset.groupId = providerGroupId(provider)
     tr.draggable = true
     tr.className = 'draggable-row'
     tr.innerHTML = `
-      <td><div class="status-cell"><span class="drag-handle" title="拖拽调整优先级" aria-label="拖拽调整优先级">↕</span>${providerBadge(provider, entry)}${isStartProvider ? '<span class="pill info">起点</span>' : ''}</div></td>
-      <td><strong>${escapeHtml(provider.name)}</strong><br><small>${escapeHtml(provider.tags.join(', ') || provider.activeCredentialLabel || '未设置分组')}</small></td>
+      <td class="provider-status-cell">
+        <div class="status-cell">
+          <span class="drag-handle" title="拖拽调整优先级" aria-label="拖拽调整优先级">↕</span>
+          <div class="status-stack">
+            <div class="status-badges">${providerBadge(provider, entry)}${isStartProvider ? '<span class="pill info">起点</span>' : ''}</div>
+            <div class="status-capability">${codexCapabilityBadge(provider)}</div>
+          </div>
+        </div>
+      </td>
+      <td>
+        <div class="provider-name-stack">
+          <strong>${escapeHtml(provider.name)}</strong>
+          ${providerGroupBadge(group)}
+          <small>${escapeHtml(provider.tags.join(', ') || provider.activeCredentialLabel || '未设置标签')}</small>
+        </div>
+      </td>
       <td>${providerWebsiteLink(provider.baseUrl)}</td>
       <td>${credentialSelect(provider)}</td>
       <td>${escapeHtml(provider.models.slice(0, 4).join(', ') || '通配')}<br><small>${wireApiLabel(provider.wireApi)} · ${providerProxyLabel(provider)}</small></td>
@@ -450,10 +601,8 @@ function renderProviders() {
           <button data-action="set-start-provider" data-id="${escapeHtml(provider.id)}" ${isStartProvider ? 'disabled' : ''}>${isStartProvider ? '当前起点' : '设为起点'}</button>
           <button data-action="test" data-id="${escapeHtml(provider.id)}">测试</button>
           <button data-action="real-test" data-id="${escapeHtml(provider.id)}">真实测试</button>
-          <button data-action="sync-usage" data-id="${escapeHtml(provider.id)}">同步扣账</button>
           <button data-action="toggle-provider" data-id="${escapeHtml(provider.id)}">${provider.enabled ? '停用' : '启用'}</button>
           <button data-action="edit-provider" data-id="${escapeHtml(provider.id)}">编辑</button>
-          <button data-action="delete-provider" data-id="${escapeHtml(provider.id)}">删除</button>
         </div>
       </td>
     `
@@ -467,6 +616,192 @@ function renderProviders() {
   rows.ondragover = handleProviderDragOver
   rows.ondrop = handleProviderDrop
   rows.ondragend = handleProviderDragEnd
+}
+
+function providerGroups() {
+  const configured = Array.isArray(state.config?.providerGroups) ? state.config.providerGroups : []
+  const groups = configured.length ? configured : [
+    { id: 'openai', name: 'OpenAI', description: 'OpenAI 与 OpenAI-compatible 中转线路', color: '#7567d8', priority: 10 },
+    { id: 'deepseek', name: 'DeepSeek', description: 'DeepSeek 模型与兼容中转线路', color: '#159a80', priority: 20 },
+  ]
+  return [...groups].sort((a, b) => Number(a.priority || 0) - Number(b.priority || 0) || a.name.localeCompare(b.name))
+}
+
+function providerGroupId(provider) {
+  const id = String(provider?.groupId || '').trim()
+  return providerGroups().some((group) => group.id === id)
+    ? id
+    : providerGroups().find((group) => group.id === 'openai')?.id || providerGroups()[0]?.id || 'openai'
+}
+
+function preferredNewProviderGroupId() {
+  const groups = providerGroups()
+  if (state.activeProviderGroupId !== 'all' && groups.some((group) => group.id === state.activeProviderGroupId)) {
+    return state.activeProviderGroupId
+  }
+  return groups.find((group) => group.id === 'openai')?.id || groups[0]?.id || 'openai'
+}
+
+function renderProviderGroupTabs(groups, providers) {
+  const tabs = $('#providerGroupTabs')
+  const allTab = `
+    <button class="provider-group-tab ${state.activeProviderGroupId === 'all' ? 'active' : ''}" type="button" role="tab" aria-selected="${state.activeProviderGroupId === 'all'}" data-group-id="all">
+      <span>全部线路</span><b>${providers.length}</b>
+    </button>
+  `
+  tabs.innerHTML = allTab + groups.map((group) => {
+    const count = providers.filter((provider) => providerGroupId(provider) === group.id).length
+    const active = state.activeProviderGroupId === group.id
+    return `
+      <button class="provider-group-tab ${active ? 'active' : ''}" style="--group-color:${safeProviderGroupColor(group.color)}" type="button" role="tab" aria-selected="${active}" data-group-id="${escapeHtml(group.id)}">
+        <i aria-hidden="true"></i><span>${escapeHtml(group.name)}</span><b>${count}</b>
+      </button>
+    `
+  }).join('')
+
+  const activeGroup = groups.find((group) => group.id === state.activeProviderGroupId)
+  $('#providerGroupSummary').innerHTML = activeGroup
+    ? `<span class="provider-group-summary-swatch" style="--group-color:${safeProviderGroupColor(activeGroup.color)}"></span><strong>${escapeHtml(activeGroup.name)}</strong><span>${escapeHtml(activeGroup.description || '未填写分组说明')}</span>`
+    : '<strong>全部线路</strong><span>分组只影响界面整理；故障转移仍由线路优先级决定。</span>'
+}
+
+function providerGroupBadge(group) {
+  if (!group) return ''
+  return `<span class="provider-group-badge" style="--group-color:${safeProviderGroupColor(group.color)}"><i aria-hidden="true"></i>${escapeHtml(group.name)}</span>`
+}
+
+function safeProviderGroupColor(value) {
+  return /^#[0-9a-f]{6}$/i.test(String(value || '')) ? value : '#667085'
+}
+
+function handleProviderGroupTabClick(event) {
+  const button = event.target.closest('[data-group-id]')
+  if (!button) return
+  state.activeProviderGroupId = button.dataset.groupId || 'all'
+  localStorage.setItem('local-model-relay-provider-group', state.activeProviderGroupId)
+  renderProviders()
+}
+
+function openProviderGroupsDialog() {
+  resetProviderGroupForm()
+  renderProviderGroupRows()
+  $('#providerGroupsDialog').showModal()
+}
+
+function renderProviderGroupRows() {
+  const groups = providerGroups()
+  const providers = state.config?.providers || []
+  const rows = $('#providerGroupRows')
+
+  rows.innerHTML = groups.map((group) => {
+    const providerCount = providers.filter((provider) => providerGroupId(provider) === group.id).length
+    const isLastGroup = groups.length <= 1
+    const deleteDisabled = providerCount > 0 || isLastGroup
+    const deleteHint = providerCount > 0
+      ? `请先把组内 ${providerCount} 条线路移动到其他分组`
+      : isLastGroup
+        ? '至少需要保留一个线路分组'
+        : `删除分组「${group.name}」`
+
+    return `
+      <article class="provider-group-row" style="--group-color:${safeProviderGroupColor(group.color)}">
+        <span class="provider-group-row-swatch" aria-hidden="true"></span>
+        <div class="provider-group-row-copy">
+          <div class="provider-group-row-title">
+            <strong>${escapeHtml(group.name)}</strong>
+            <span>${providerCount} 条线路</span>
+          </div>
+          <p>${escapeHtml(group.description || '未填写分组说明')}</p>
+        </div>
+        <div class="provider-group-row-actions">
+          <button class="ghost" type="button" data-action="edit-provider-group" data-id="${escapeHtml(group.id)}">编辑</button>
+          <button class="danger" type="button" data-action="delete-provider-group" data-id="${escapeHtml(group.id)}" ${deleteDisabled ? 'disabled' : ''} title="${escapeHtml(deleteHint)}">删除</button>
+        </div>
+      </article>
+    `
+  }).join('')
+}
+
+async function handleProviderGroupAction(event) {
+  const button = event.target.closest('button[data-action]')
+  if (!button) return
+  const group = providerGroups().find((item) => item.id === button.dataset.id)
+  if (!group) return
+
+  if (button.dataset.action === 'edit-provider-group') {
+    state.editingProviderGroup = group
+    const form = $('#providerGroupForm')
+    formField(form, 'id').value = group.id
+    formField(form, 'name').value = group.name
+    formField(form, 'color').value = safeProviderGroupColor(group.color)
+    formField(form, 'description').value = group.description || ''
+    $('#providerGroupEditorTitle').textContent = `编辑分组：${group.name}`
+    formField(form, 'name').focus()
+    return
+  }
+
+  if (button.dataset.action === 'delete-provider-group') {
+    const providerCount = (state.config?.providers || []).filter((provider) => providerGroupId(provider) === group.id).length
+    if (providerCount > 0) {
+      toast(`请先把组内 ${providerCount} 条线路移动到其他分组`)
+      return
+    }
+    if (!confirm(`删除线路分组「${group.name}」？`)) return
+
+    button.disabled = true
+    try {
+      await api(`/api/provider-groups/${group.id}`, { method: 'DELETE' })
+      if (state.activeProviderGroupId === group.id) {
+        state.activeProviderGroupId = 'all'
+        localStorage.setItem('local-model-relay-provider-group', 'all')
+      }
+      if (state.editingProviderGroup?.id === group.id) resetProviderGroupForm()
+      await refreshAll()
+      renderProviderGroupRows()
+      toast('线路分组已删除')
+    } finally {
+      button.disabled = false
+    }
+  }
+}
+
+async function saveProviderGroup(event) {
+  event.preventDefault()
+  const form = event.currentTarget
+  const id = formField(form, 'id').value
+  const body = {
+    name: formField(form, 'name').value.trim(),
+    color: safeProviderGroupColor(formField(form, 'color').value),
+    description: formField(form, 'description').value.trim(),
+  }
+  const submit = form.querySelector('button[type="submit"]')
+
+  submit.disabled = true
+  try {
+    const saved = await api(id ? `/api/provider-groups/${id}` : '/api/provider-groups', {
+      method: id ? 'PATCH' : 'POST',
+      body,
+    })
+    if (!id && saved?.id) {
+      state.activeProviderGroupId = saved.id
+      localStorage.setItem('local-model-relay-provider-group', saved.id)
+    }
+    await refreshAll()
+    resetProviderGroupForm()
+    renderProviderGroupRows()
+    toast(id ? '线路分组已更新' : '线路分组已创建')
+  } finally {
+    submit.disabled = false
+  }
+}
+
+function resetProviderGroupForm() {
+  state.editingProviderGroup = null
+  const form = $('#providerGroupForm')
+  form.reset()
+  formField(form, 'id').value = ''
+  formField(form, 'color').value = '#667085'
+  $('#providerGroupEditorTitle').textContent = '新增分组'
 }
 
 // dragstart 的 event.target 是设了 draggable 的 <tr> 本身，不是手柄子元素，
@@ -489,6 +824,7 @@ function renderRoutes() {
       <td>${escapeHtml(route.notes || '-')}</td>
       <td>
         <div class="row-actions">
+          <button data-action="route-test" data-id="${escapeHtml(route.id)}" ${route.enabled ? '' : 'disabled title="请先启用该模型路由"'}>测试路由</button>
           <button data-action="toggle-route" data-id="${escapeHtml(route.id)}">${route.enabled ? '停用' : '启用'}</button>
           <button data-action="edit-route" data-id="${escapeHtml(route.id)}">编辑</button>
           <button data-action="delete-route" data-id="${escapeHtml(route.id)}">删除</button>
@@ -519,16 +855,18 @@ function renderLogs() {
   })
   list.innerHTML = logs.length ? '' : `<div class="empty">暂无请求记录。</div>`
 
-  for (const log of logs.slice(page.start, page.end)) {
+  for (let index = page.start; index < page.end; index += 1) {
+    const log = logs[index]
+    const compactSummary = compactLogErrorSummary(log)
+    const errorSummary = logErrorSummaryMarkup(log, index)
     const item = document.createElement('div')
     item.className = 'log-item'
     item.innerHTML = `
       <div><strong>${new Date(log.time).toLocaleString()}</strong><br><small>${escapeHtml(log.method || '')} ${escapeHtml(log.path || '')}</small></div>
-      <div><strong>${escapeHtml(log.model || '-')}</strong><br><small>${escapeHtml(log.providerName || log.error || '-')}</small></div>
-      <div>${logStatusPill(log)}</div>
+      <div><strong>${escapeHtml(log.model || '-')}</strong><br><small>${escapeHtml(log.providerName || compactSummary?.title || '-')}</small></div>
+      <div class="log-status-cell">${logStatusPill(log)}${errorSummary}</div>
       <div>${usageMini(log.usage)}</div>
       <div><strong>${log.durationMs ?? '-'} ms</strong><br><small>${escapeHtml(logStatusText(log))}</small></div>
-      ${logDiagnosticsMarkup(log)}
     `
     list.appendChild(item)
   }
@@ -824,21 +1162,23 @@ function renderRecords() {
   })
   rows.innerHTML = records.length ? '' : '<tr><td colspan="7" class="empty">没有匹配的请求记录。</td></tr>'
 
+  const allLogs = state.runtime?.requestLog || []
   for (const log of records.slice(page.start, page.end)) {
     const usage = log.usage || {}
-    const attemptLine = (log.attempts || [])
-      .map((attempt) => `${attempt.providerName || '-'}${attempt.status ? `(${attempt.status})` : ''}`)
-      .join(' → ')
+    const logIndex = allLogs.indexOf(log)
+    const errorSummary = logErrorSummaryMarkup(log, logIndex)
+    const statusSummary = errorSummary || `<small>${escapeHtml(logStatusText(log))}</small>`
+    const attemptLine = compactAttemptLine(log)
     const credentialLabel = log.credentialLabel || (log.attempts || []).find((attempt) => attempt.credentialLabel)?.credentialLabel || '-'
     const tr = document.createElement('tr')
     tr.innerHTML = `
       <td><strong>${new Date(log.time).toLocaleString()}</strong><br><small>${escapeHtml(log.method || '')} ${escapeHtml(log.path || '')}</small></td>
       <td><strong>${escapeHtml(log.model || '-')}</strong><br><small>${escapeHtml(log.routedModel || '-')}</small></td>
       <td><strong>${escapeHtml(log.providerName || '-')}</strong><br><small>${escapeHtml(credentialLabel)}</small></td>
-      <td>${logStatusPill(log)}<br><small>${escapeHtml(logStatusText(log))}</small>${logDiagnosticsMarkup(log, 2)}</td>
+      <td><div class="record-status-cell">${logStatusPill(log)}${statusSummary}</div></td>
       <td><strong>${formatTokenCompact(usage.totalTokens)}</strong><br><small>入 ${formatTokenCompact(usage.inputTokens)} / 出 ${formatTokenCompact(usage.outputTokens)} / 缓存 ${cacheUsageText(usage)}${usage.estimated ? ' · 估算' : ''}</small></td>
       <td><strong>${log.durationMs ?? '-'} ms</strong></td>
-      <td><small>${escapeHtml(attemptLine || log.error || '-')}</small></td>
+      <td><small>${escapeHtml(attemptLine)}</small></td>
     `
     rows.appendChild(tr)
   }
@@ -1125,7 +1465,7 @@ function renderCredentialUsageRows() {
       <div><strong>${escapeHtml(entry.provider.name)} / ${escapeHtml(entry.credential.label || '默认')}</strong><small>${escapeHtml(credentialGroupLine(entry))}</small></div>
       <div><strong>${formatTokenCompact(entry.local.totalTokens)}</strong><small>${formatNumber(entry.local.requests)} 次请求</small></div>
       <div><strong>${escapeHtml(estimatedCostText(entry.credential.id, entry.local))}</strong><small>本地估算</small></div>
-      <div><strong>${escapeHtml(upstreamQuotaText(entry.upstream))}</strong><small>${escapeHtml(upstreamSyncText(entry.upstream))}</small></div>
+      <div><strong>${escapeHtml(upstreamQuotaText(entry.upstream))}</strong><small>${escapeHtml(upstreamRecordText(entry.upstream))}</small></div>
     `
     rows.appendChild(item)
   }
@@ -1411,13 +1751,19 @@ async function saveProviderOrderSafely(ids) {
 }
 
 async function saveProviderOrder(ids) {
-  const orderedProviders = [...state.config.providers].sort((a, b) => a.priority - b.priority)
+  const scopedProviders = state.activeProviderGroupId === 'all'
+    ? [...state.config.providers]
+    : state.config.providers.filter((provider) => providerGroupId(provider) === state.activeProviderGroupId)
+  const orderedProviders = scopedProviders.sort((a, b) => a.priority - b.priority)
   if (orderedProviders.map((provider) => provider.id).join('|') === ids.join('|')) return
+  const prioritySlots = orderedProviders.map((provider) => Number(provider.priority) || 0).sort((a, b) => a - b)
 
   for (const [index, id] of ids.entries()) {
     const provider = state.config.providers.find((item) => item.id === id)
     if (!provider) continue
-    const priority = (index + 1) * 10
+    const priority = state.activeProviderGroupId === 'all'
+      ? (index + 1) * 10
+      : prioritySlots[index]
     if (provider.priority === priority) continue
     await api(`/api/providers/${id}`, {
       method: 'PATCH',
@@ -1431,33 +1777,41 @@ async function saveProviderOrder(ids) {
 async function handleProviderAction(event) {
   const button = event.target.closest('button')
   if (!button) return
+  if (button.dataset.action === 'new-provider') {
+    openProviderDialog(null, preferredNewProviderGroupId())
+    return
+  }
   const provider = state.config.providers.find((item) => item.id === button.dataset.id)
   if (!provider) return
 
   if (button.dataset.action === 'edit-provider') openProviderDialog(provider)
   if (button.dataset.action === 'real-test') openRealTestDialog(provider)
   if (button.dataset.action === 'set-start-provider') {
+    const requestedMode = ['auto', 'locked', 'pinned'].includes(state.runtime?.routing?.startMode)
+      ? state.runtime.routing.startMode
+      : 'auto'
     state.runtime = await api('/api/routing/start', {
       method: 'POST',
       body: {
         providerId: provider.id,
-        mode: state.runtime?.routing?.startMode || 'auto',
+        mode: requestedMode,
       },
     })
-    toast(`已设为路由起点：${provider.name}`)
     renderStatus()
     renderRoutingBar()
     renderProviders()
+    renderRuntimeNotice()
+    const actualProviderId = state.runtime?.routing?.startProviderId || ''
+    const actualMode = state.runtime?.routing?.startMode || 'auto'
+    if (actualProviderId !== provider.id || actualMode !== requestedMode) {
+      toast(`起点未生效：后台仍为“${routingModeLabel(actualMode)}”，请重启 Local Model Relay`)
+      return
+    }
+    toast(`已设为路由起点：${provider.name}`)
   }
   if (button.dataset.action === 'toggle-provider') {
     await api(`/api/providers/${provider.id}`, { method: 'PATCH', body: { enabled: !provider.enabled } })
     toast(provider.enabled ? '线路已停用' : '线路已启用')
-    await refreshAll()
-  }
-  if (button.dataset.action === 'delete-provider') {
-    if (!confirm(`删除线路「${provider.name}」？相关模型路由也会移除。`)) return
-    await api(`/api/providers/${provider.id}`, { method: 'DELETE' })
-    toast('线路已删除')
     await refreshAll()
   }
   if (button.dataset.action === 'test') {
@@ -1481,40 +1835,43 @@ async function handleProviderAction(event) {
       button.textContent = '测试'
     }
   }
-  if (button.dataset.action === 'sync-usage') {
-    button.disabled = true
-    button.textContent = '同步中'
-    try {
-      const result = await api(`/api/providers/${provider.id}/usage-sync`, {
-        method: 'POST',
-        body: { credentialId: provider.activeCredentialId },
-      })
-      toast(result.ok ? `同步成功：${result.snapshot?.group || result.credentialLabel || provider.name}` : `同步失败：${result.message}`)
-      await refreshAll()
-    } finally {
-      button.disabled = false
-      button.textContent = '同步扣账'
-    }
-  }
 }
 
 async function saveRoutingMode(event) {
-  const mode = event.currentTarget.value === 'locked' ? 'locked' : 'auto'
+  const mode = ['auto', 'locked', 'pinned'].includes(event.currentTarget.value)
+    ? event.currentTarget.value
+    : 'auto'
   const providerId = state.runtime?.routing?.startProviderId || ''
-  state.runtime = await api('/api/routing/start', {
+  if (mode === 'pinned' && !providerId) {
+    toast('请先在线路列表中把一条线路设为起点')
+    renderRoutingBar()
+    return
+  }
+  const nextRuntime = await api('/api/routing/start', {
     method: 'POST',
     body: { providerId, mode },
   })
+  state.runtime = nextRuntime
   renderRoutingBar()
   renderProviders()
-  toast(mode === 'locked' ? '路由起点已锁定' : '路由起点将随成功线路自动推进')
+  const actualMode = state.runtime?.routing?.startMode || 'auto'
+  if (actualMode !== mode) {
+    toast(`模式未生效：后台仍为“${routingModeLabel(actualMode)}”，请重启 Local Model Relay`)
+    return
+  }
+  toast(mode === 'pinned'
+    ? '已启用单线锁定：线路失败时不会故障转移'
+    : mode === 'locked'
+      ? '路由起点已锁定，失败时仍会故障转移'
+      : '路由起点将随成功线路自动推进')
 }
 
 async function clearStartProvider() {
+  const wasPinned = state.runtime?.routing?.startMode === 'pinned'
   state.runtime = await api('/api/routing/start', { method: 'DELETE' })
   renderRoutingBar()
   renderProviders()
-  toast('已清除路由起点')
+  toast(wasPinned ? '已清除起点并退出单线锁定' : '已清除路由起点')
 }
 
 function openRealTestDialog(provider) {
@@ -1546,11 +1903,51 @@ function openRealTestDialog(provider) {
 
   const runButton = $('#runRealTestBtn')
   runButton.disabled = models.length === 0
+  $('#runCodexTestBtn').disabled = models.length === 0
+  renderCodexTestResult(null)
   renderRealTestResult(models.length ? null : {
     skipped: true,
     message: '当前线路没有已保存的支持模型，请先在线路列表中运行“测试”并写入模型。',
   })
   $('#realTestDialog').showModal()
+}
+
+async function runCodexCompatibilityTestForForm(form) {
+  const providerId = formField(form, 'providerId').value
+  const model = formField(form, 'model').value.trim()
+  const button = $('#runCodexTestBtn')
+  if (!providerId || !model) {
+    toast('请先选择要验证的模型')
+    return
+  }
+
+  button.disabled = true
+  button.textContent = '验证中'
+  renderCodexTestResult({ pending: true })
+  await nextFrame()
+
+  try {
+    const result = await api(`/api/providers/${providerId}/codex-test`, {
+      method: 'POST',
+      body: {
+        model,
+        credentialId: formField(form, 'credentialId').value,
+      },
+    })
+    renderCodexTestResult(result)
+    toast(result.ok ? 'Codex 兼容性验证通过' : `Codex 验证失败：${result.message || `HTTP ${result.status || 0}`}`)
+    await refreshAll()
+  } catch (error) {
+    renderCodexTestResult({
+      ok: false,
+      status: 0,
+      message: error instanceof Error ? error.message : String(error),
+      checks: {},
+    })
+  } finally {
+    button.disabled = !formField(form, 'model').value.trim()
+    button.textContent = '运行 Codex 验证'
+  }
 }
 
 async function runRealTest(event) {
@@ -1737,6 +2134,158 @@ function renderRealTestResult(result = null) {
   `
 }
 
+function renderCodexTestResult(result = null) {
+  const node = $('#codexTestResult')
+  if (!result) {
+    node.className = 'codex-test-result empty'
+    node.textContent = '尚未运行 Codex 兼容性验证。'
+    return
+  }
+
+  node.className = `codex-test-result ${result.pending ? 'pending' : result.ok ? 'ok' : 'warn'}`
+  if (result.pending) {
+    node.textContent = '正在检查文本流和函数调用流...'
+    return
+  }
+  if (result.skipped) {
+    node.textContent = result.message || '当前配置无法进行 Codex 验证。'
+    return
+  }
+
+  const textCheck = result.checks?.text || {}
+  const toolCheck = result.checks?.toolCall || {}
+  node.innerHTML = `
+    <div><span class="label">状态</span><strong>${result.ok ? '通过' : '失败'} · HTTP ${result.status || 0}</strong></div>
+    <div><span class="label">耗时</span><strong>${result.latencyMs || '-'} ms</strong></div>
+    <div><span class="label">文本流</span><strong>${escapeHtml(codexCheckLabel(textCheck))}</strong></div>
+    <div><span class="label">函数调用流</span><strong>${escapeHtml(codexCheckLabel(toolCheck))}</strong></div>
+    <div class="wide"><span class="label">说明</span><strong>${escapeHtml(result.message || '-')}</strong></div>
+  `
+}
+
+function codexCheckLabel(check = {}) {
+  const bits = []
+  if (check.ok) bits.push('通过')
+  if (check.status) bits.push(`HTTP ${check.status}`)
+  if (check.hasText) bits.push('收到文本')
+  if (check.hasToolCall) bits.push('收到函数调用')
+  return bits.join(' · ') || check.message || '未返回有效检查结果'
+}
+
+function openRouteTestDialog(route) {
+  if (!route?.enabled) {
+    toast('请先启用该模型路由')
+    return
+  }
+
+  state.testingRoute = route
+  const form = $('#routeTestForm')
+  form.reset()
+  formField(form, 'routeId').value = route.id
+  formField(form, 'prompt').value = 'Reply with exactly: OK'
+  formField(form, 'maxTokens').value = 8
+  $('#routeTestDialogTitle').textContent = `模型路由测试：${route.virtualModel}`
+  $('#routeTestVirtualModel').textContent = route.virtualModel
+
+  const targets = [...(route.targets || [])]
+    .sort((left, right) => left.priority - right.priority || left.providerName.localeCompare(right.providerName))
+  $('#routeTestCandidates').innerHTML = targets.length
+    ? targets.map((target, index) => `
+        <span class="route-test-candidate">
+          <b>${index + 1}</b>${escapeHtml(target.providerName)}<small>${escapeHtml(target.model)}</small>
+        </span>
+      `).join('')
+    : '<span class="muted">没有已配置的候选线路。</span>'
+
+  $('#runRouteTestBtn').disabled = targets.length === 0
+  renderRouteTestResult(null)
+  $('#routeTestDialog').showModal()
+}
+
+async function runRouteTest(event) {
+  event.preventDefault()
+  const form = event.currentTarget
+  const routeId = formField(form, 'routeId').value
+  const button = $('#runRouteTestBtn')
+  button.disabled = true
+  button.textContent = '测试中'
+  renderRouteTestResult({ pending: true })
+  await nextFrame()
+
+  try {
+    const result = await api(`/api/routes/${routeId}/real-test`, {
+      method: 'POST',
+      body: {
+        prompt: formField(form, 'prompt').value,
+        maxTokens: Number(formField(form, 'maxTokens').value),
+      },
+    })
+    renderRouteTestResult(result)
+    toast(result.ok
+      ? `路由测试成功：${result.providerName} · ${result.latencyMs} ms`
+      : `路由测试失败：HTTP ${result.status || 0}`)
+  } catch (error) {
+    renderRouteTestResult({
+      ok: false,
+      status: 0,
+      latencyMs: 0,
+      attempts: [],
+      message: error instanceof Error ? error.message : String(error),
+    })
+  } finally {
+    button.disabled = false
+    button.textContent = '运行路由测试'
+    await refreshState()
+  }
+}
+
+function renderRouteTestResult(result = null) {
+  const node = $('#routeTestResult')
+  if (!result) {
+    node.className = 'route-test-result empty'
+    node.textContent = '尚未运行模型路由测试。'
+    return
+  }
+
+  node.className = `route-test-result ${result.pending ? 'pending' : result.ok ? 'ok' : 'warn'}`
+  if (result.pending) {
+    node.textContent = '正在按当前模型路由顺序向上游发起真实请求...'
+    return
+  }
+
+  const attempts = Array.isArray(result.attempts) ? result.attempts : []
+  const finalProvider = result.providerName || (attempts.at(-1)?.providerName || '-')
+  const routedModel = result.routedModel || result.model || '-'
+  const attemptMarkup = attempts.length
+    ? attempts.map((attempt, index) => {
+      const status = attempt.skipped ? '跳过' : attempt.ok ? '成功' : '失败'
+      const style = attempt.skipped ? 'skip' : attempt.ok ? 'ok' : 'warn'
+      const detail = attempt.message || attempt.reason || ''
+      return `
+        <li class="route-test-attempt ${style}">
+          <div class="route-test-attempt-main">
+            <span class="route-test-index">${index + 1}</span>
+            <div><strong>${escapeHtml(attempt.providerName || '未命名线路')}</strong><small>${escapeHtml(attempt.model || '-')} · ${escapeHtml(wireApiLabel(attempt.wireApi || 'chat'))}</small></div>
+          </div>
+          <div class="route-test-attempt-meta"><span class="pill ${style === 'ok' ? 'ok' : style === 'skip' ? 'off' : 'warn'}">${status}${attempt.status ? ` · HTTP ${attempt.status}` : ''}</span><strong>${Number(attempt.latencyMs) || 0} ms</strong></div>
+          ${detail ? `<p>${escapeHtml(detail)}</p>` : ''}
+        </li>
+      `
+    }).join('')
+    : '<li class="route-test-empty">本次没有可尝试的线路。请检查模型路由、线路开关、Key 和冷却状态。</li>'
+
+  node.innerHTML = `
+    <section class="route-test-summary">
+      <div><span class="label">结果</span><strong>${result.ok ? '成功' : '失败'} · HTTP ${result.status || 0}</strong></div>
+      <div><span class="label">总耗时</span><strong>${Number(result.latencyMs) || 0} ms</strong></div>
+      <div><span class="label">最终线路</span><strong>${escapeHtml(finalProvider)}</strong></div>
+      <div><span class="label">真实模型</span><strong>${escapeHtml(routedModel)}</strong></div>
+    </section>
+    <section class="route-test-attempts"><h3>逐条尝试</h3><ol>${attemptMarkup}</ol></section>
+    <section class="route-test-response"><span class="label">回复摘要</span><pre>${escapeHtml(result.content || result.message || '-')}</pre></section>
+  `
+}
+
 async function handleCredentialSwitch(event) {
   const select = event.target.closest('[data-action="switch-credential"]')
   if (!select) return
@@ -1755,6 +2304,7 @@ async function handleRouteAction(event) {
   if (!route) return
 
   if (button.dataset.action === 'edit-route') openRouteDialog(route)
+  if (button.dataset.action === 'route-test') openRouteTestDialog(route)
   if (button.dataset.action === 'toggle-route') {
     await api(`/api/routes/${route.id}`, { method: 'PATCH', body: { enabled: !route.enabled } })
     toast(route.enabled ? '路由已停用' : '路由已启用')
@@ -1768,13 +2318,25 @@ async function handleRouteAction(event) {
   }
 }
 
-function openProviderDialog(provider = null) {
+function openProviderDialog(provider = null, preferredGroupId = '') {
   state.editingProvider = provider
   const form = $('#providerForm')
   form.reset()
+  const groups = providerGroups()
+  const groupSelect = formField(form, 'groupId')
+  groupSelect.innerHTML = groups.map((group) => (
+    `<option value="${escapeHtml(group.id)}">${escapeHtml(group.name)}</option>`
+  )).join('')
+  const fallbackGroupId = groups.find((group) => group.id === 'openai')?.id || groups[0]?.id || 'openai'
+  const requestedGroupId = provider
+    ? providerGroupId(provider)
+    : groups.some((group) => group.id === preferredGroupId)
+      ? preferredGroupId
+      : fallbackGroupId
   $('#providerDialogTitle').textContent = provider ? '编辑线路' : '新增线路'
   formField(form, 'id').value = provider?.id || ''
   formField(form, 'name').value = provider?.name || ''
+  groupSelect.value = requestedGroupId
   formField(form, 'baseUrl').value = provider?.baseUrl || ''
   formField(form, 'authMode').value = provider?.authMode || 'authorization'
   formField(form, 'wireApi').value = provider?.wireApi || 'chat'
@@ -1787,6 +2349,7 @@ function openProviderDialog(provider = null) {
   formField(form, 'tags').value = provider?.tags?.join(', ') || ''
   formField(form, 'notes').value = provider?.notes || ''
   formField(form, 'enabled').checked = provider ? provider.enabled : true
+  $('#providerDangerZone').hidden = !provider
   $('#credentialRows').innerHTML = ''
   const credentials = provider?.credentials?.length
     ? provider.credentials
@@ -1795,6 +2358,24 @@ function openProviderDialog(provider = null) {
   renderProviderProxyFields()
   renderProviderTimeoutHint()
   $('#providerDialog').showModal()
+}
+
+async function deleteProviderFromEditor() {
+  const provider = state.editingProvider
+  if (!provider?.id) return
+  if (!confirm(`删除线路「${provider.name}」？相关模型路由也会移除。`)) return
+
+  const button = $('#deleteProviderBtn')
+  button.disabled = true
+  try {
+    await api(`/api/providers/${provider.id}`, { method: 'DELETE' })
+    $('#providerDialog').close()
+    state.editingProvider = null
+    toast('线路已删除')
+    await refreshAll()
+  } finally {
+    button.disabled = false
+  }
 }
 
 function renderProviderTimeoutHint() {
@@ -1817,6 +2398,7 @@ async function saveProvider(event) {
   const form = event.currentTarget
   const body = {
     name: formField(form, 'name').value,
+    groupId: formField(form, 'groupId').value,
     baseUrl: formField(form, 'baseUrl').value,
     credentials: readCredentialRows(),
     activeCredentialId: $('.credential-row input[name="activeCredential"]:checked')?.value || '',
@@ -2062,6 +2644,18 @@ async function saveSettings(event) {
       defaultCooldownSeconds: Number(formField(form, 'defaultCooldownSeconds').value),
       reconnectFailureThreshold: Number(formField(form, 'reconnectFailureThreshold').value),
       reconnectCooldownSeconds: Number(formField(form, 'reconnectCooldownSeconds').value),
+      sessionAffinity: formField(form, 'sessionAffinity').checked,
+      capabilityRouting: formField(form, 'capabilityRouting').checked,
+      sessionTtlSeconds: Number(formField(form, 'sessionTtlSeconds').value),
+      sessionLimit: Number(formField(form, 'sessionLimit').value),
+      diagnosticsLlm: {
+        enabled: formField(form, 'diagnosticsLlmEnabled').checked,
+        baseUrl: formField(form, 'diagnosticsLlmBaseUrl').value,
+        model: formField(form, 'diagnosticsLlmModel').value,
+        apiKey: formField(form, 'diagnosticsLlmApiKey').value,
+        timeoutMs: Number(formField(form, 'diagnosticsLlmTimeoutSeconds').value) * 1000,
+        clearApiKey: state.clearDiagnosticsLlmKey,
+      },
       retryStatusCodes: splitList(formField(form, 'retryStatusCodes').value).map(Number),
       logRequests: formField(form, 'logRequests').checked,
       collectUsage: formField(form, 'collectUsage').checked,
@@ -2152,6 +2746,54 @@ function toggleLocalKeyVisibility() {
   button.textContent = visible ? '显示' : '隐藏'
 }
 
+function toggleDiagnosticsKeyVisibility() {
+  const input = formField($('#settingsForm'), 'diagnosticsLlmApiKey')
+  const button = $('#toggleDiagnosticsKeyBtn')
+  const visible = input.type === 'text'
+  input.type = visible ? 'password' : 'text'
+  button.textContent = visible ? '显示' : '隐藏'
+}
+
+function clearDiagnosticsKey() {
+  const input = formField($('#settingsForm'), 'diagnosticsLlmApiKey')
+  input.value = ''
+  state.clearDiagnosticsLlmKey = true
+  updateDiagnosticsKeyStatus()
+  toast('保存设置后将清除诊断 Key')
+}
+
+function updateDiagnosticsKeyStatus() {
+  const status = $('#diagnosticsKeyStatus')
+  if (!status) return
+  if (state.clearDiagnosticsLlmKey) {
+    status.textContent = '保存后清除当前 Key'
+    status.classList.add('warn')
+    return
+  }
+  const diagnosticsLlm = state.config?.service?.diagnosticsLlm || {}
+  status.textContent = diagnosticsLlm.apiKeySet
+    ? `已配置：${diagnosticsLlm.apiKeyMasked || '已隐藏'}`
+    : '尚未配置 Key；本地无鉴权接口也可以留空。'
+  status.classList.remove('warn')
+}
+
+async function testDiagnosticsLlm() {
+  const button = $('#testDiagnosticsLlmBtn')
+  const status = $('#diagnosticsLlmStatus')
+  button.disabled = true
+  status.textContent = '正在请求诊断模型……'
+  try {
+    const response = await api('/api/diagnostics/ai/test', { method: 'POST' })
+    const result = response.result || {}
+    status.textContent = `测试成功 · ${response.latencyMs || 0} ms · ${result.summary || '已收到返回'}`
+    toast('AI 诊断接口测试成功')
+  } catch (error) {
+    status.textContent = `测试失败：${error.message || '请检查配置'}`
+  } finally {
+    button.disabled = false
+  }
+}
+
 async function copyBaseUrl() {
   await navigator.clipboard.writeText($('#baseUrl').textContent)
   toast('本地接口地址已复制')
@@ -2167,7 +2809,14 @@ async function api(path, options = {}) {
   const response = await fetch(path, init)
   const data = await response.json().catch(() => ({}))
   if (!response.ok) {
-    throwToast(data.error?.message || `请求失败：${response.status}`)
+    const message = data.error?.message || `请求失败：${response.status}`
+    if (options.silent) {
+      const error = new Error(message)
+      error.status = response.status
+      error.code = data.error?.type || ''
+      throw error
+    }
+    throwToast(message)
   }
   return data
 }
@@ -2175,6 +2824,13 @@ async function api(path, options = {}) {
 function throwToast(message) {
   toast(message)
   throw new Error(message)
+}
+
+function codexCapabilityBadge(provider) {
+  const results = Object.values(provider?.capabilities?.codex?.models || {})
+  if (results.some((item) => item?.status === 'failed')) return '<span class="pill warn" title="至少一个模型未通过真实 Codex 验证">Codex 失败</span>'
+  if (results.some((item) => item?.status === 'verified')) return '<span class="pill ok" title="至少一个模型已通过真实 Codex 验证">Codex 已验</span>'
+  return '<span class="pill off" title="尚未运行真实 Codex 验证">Codex 未验</span>'
 }
 
 function providerBadge(provider, entry) {
@@ -2237,7 +2893,7 @@ function credentialMeta(provider) {
 function credentialGroupLine(entry) {
   const bits = []
   if (entry.credential.upstreamGroup) bits.push(`分组 ${entry.credential.upstreamGroup}`)
-  if (entry.upstream?.group && entry.upstream.group !== entry.credential.upstreamGroup) bits.push(`同步 ${entry.upstream.group}`)
+  if (entry.upstream?.group && entry.upstream.group !== entry.credential.upstreamGroup) bits.push(`上游 ${entry.upstream.group}`)
   bits.push(`x${trimNumber(entry.credential.rate || 1)}`)
   return bits.join(' · ')
 }
@@ -2246,13 +2902,13 @@ function upstreamQuotaText(upstream) {
   if (!upstream) return '-'
   const quotaPerCny = Number(state.config?.service?.quotaPerCny || 500000)
   const usedQuota = Number(upstream.usedQuota || 0)
-  if (!usedQuota) return '已同步'
+  if (!usedQuota) return '上游已记录'
   const yuan = quotaPerCny ? usedQuota / quotaPerCny : 0
   return `${formatTokenCompact(usedQuota)} quota${yuan ? ` / ¥${trimNumber(yuan)}` : ''}`
 }
 
-function upstreamSyncText(upstream) {
-  if (!upstream?.updatedAt) return '服务商扣账'
+function upstreamRecordText(upstream) {
+  if (!upstream?.updatedAt) return '历史上游记录'
   return new Date(upstream.updatedAt).toLocaleString()
 }
 
@@ -2345,6 +3001,22 @@ function cacheCoverageText(usage = {}) {
   return bits.join(' · ')
 }
 
+const COMPACT_ERROR_TITLES = new Map([
+  [400, '请求参数被拒绝'],
+  [401, '上游鉴权失败'],
+  [402, '上游额度或余额不足'],
+  [403, '上游权限或模型受限'],
+  [404, '接口或模型不存在'],
+  [408, '上游请求超时'],
+  [409, '上游请求冲突'],
+  [425, '上游暂时过载'],
+  [429, '上游频率限制'],
+  [500, '上游内部错误'],
+  [502, '上游网关或线路异常'],
+  [503, '上游服务暂不可用'],
+  [504, '上游网关超时'],
+])
+
 function logStatusPill(log) {
   if (log?.outcome === 'real_test_success') return '<span class="pill info">测试成功</span>'
   if (log?.outcome === 'real_test_failed') return '<span class="pill warn">测试失败</span>'
@@ -2377,6 +3049,333 @@ function firstLogDiagnostic(log) {
   return log.diagnostics.find((item) => item?.type === 'upstream_error') ||
     log.diagnostics.find((item) => item && typeof item === 'object') ||
     null
+}
+
+function logErrorSummaryMarkup(log, logIndex) {
+  const summary = compactLogErrorSummary(log)
+  if (!summary || !Number.isInteger(logIndex) || logIndex < 0) return ''
+  const tone = log?.ok && !isClientDisconnected(log) ? 'neutral' : 'warn'
+  return `
+    <button class="error-summary-button ${tone}" type="button" data-action="show-error-detail" data-log-index="${escapeHtml(logIndex)}" title="查看并复制完整失败原因">
+      <span class="error-summary-code">${escapeHtml(summary.code)}</span>
+      <span class="error-summary-title">${escapeHtml(summary.title)}</span>
+      <span class="error-summary-more">详情</span>
+    </button>
+  `
+}
+
+function compactAttemptLine(log) {
+  const attempts = Array.isArray(log?.attempts) ? log.attempts : []
+  if (attempts.length) {
+    return attempts
+      .map((attempt) => `${attempt.providerName || '-'}${attempt.status ? `(${attempt.status})` : ''}`)
+      .join(' → ')
+  }
+  const summary = compactLogErrorSummary(log)
+  if (summary) return `${summary.code} · ${summary.title}`
+  if (log?.error) return truncateInline(redactSensitiveText(log.error), 80)
+  return '-'
+}
+
+function compactLogErrorSummary(log) {
+  const failedAttempt = firstFailedAttempt(log)
+  const diagnostic = firstLogDiagnostic(log) || failedAttempt?.diagnostic || null
+  const hasDetail = diagnostic || failedAttempt || log?.error || isClientDisconnected(log)
+  if (!hasDetail) return null
+
+  const status = normalizeStatus(diagnostic?.status) ||
+    normalizeStatus(log?.ok ? 0 : log?.status) ||
+    normalizeStatus(failedAttempt?.status)
+  const code = status ? String(status) : (isClientDisconnected(log) ? '中断' : (log?.ok ? '切线' : '错误'))
+  let title = statusTitle(status) || compactErrorTitle(diagnostic?.title || failedAttempt?.message || log?.error)
+
+  if (log?.ok && !isClientDisconnected(log) && (failedAttempt || diagnostic)) {
+    title = status ? '已故障转移' : (title || '路由详情')
+  }
+  if (!title) title = log?.ok ? '路由详情' : '请求失败'
+  return { code, title: truncateInline(title, 24), status }
+}
+
+function firstFailedAttempt(log) {
+  const attempts = Array.isArray(log?.attempts) ? log.attempts : []
+  return attempts.find((attempt) => attempt && !attempt.ok && !attempt.skipped && (
+    attempt.status || attempt.error || attempt.message || attempt.reason || attempt.diagnostic
+  )) || attempts.find((attempt) => attempt && (attempt.diagnostic || attempt.error || attempt.message || attempt.reason)) || null
+}
+
+function normalizeStatus(value) {
+  const status = Number(value)
+  return Number.isFinite(status) && status > 0 ? status : 0
+}
+
+function statusTitle(status) {
+  if (!status) return ''
+  return COMPACT_ERROR_TITLES.get(status) || `HTTP ${status}`
+}
+
+function compactErrorTitle(value) {
+  const text = truncateInline(redactSensitiveText(value || ''), 80)
+  return text
+    .replace(/^上游返回 HTTP \d+[：:]?\s{0,}/, '上游错误')
+    .replace(/^请求失败[：:]?\s{0,}/, '')
+}
+
+function truncateInline(value, limit = 80) {
+  const text = String(value || '').replace(/\s+/g, ' ').trim()
+  return text.length > limit ? `${text.slice(0, limit - 1)}…` : text
+}
+
+function handleErrorDetailAction(event) {
+  const trigger = event.target.closest('[data-action="show-error-detail"]')
+  if (!trigger) return
+  event.preventDefault()
+  const index = Number(trigger.dataset.logIndex)
+  const log = Number.isInteger(index) ? state.runtime?.requestLog?.[index] : null
+  if (!log) {
+    toast('这条记录刚刚刷新了，请重新打开详情')
+    return
+  }
+  openErrorDetailDialog(log)
+}
+
+function openErrorDetailDialog(log) {
+  const summary = compactLogErrorSummary(log) || { code: '详情', title: '请求详情' }
+  $('#errorDetailTitle').textContent = `${summary.code} · ${summary.title}`
+  $('#errorDetailSummary').innerHTML = errorDetailSummaryMarkup(log, summary)
+  state.selectedErrorLog = log
+  state.aiDiagnosis = null
+  state.selectedErrorDetail = formatLogErrorDetail(log)
+  $('#errorDetailText').textContent = state.selectedErrorDetail
+  renderAiDiagnosis()
+  $('#errorDetailDialog').showModal()
+}
+
+function errorDetailSummaryMarkup(log, summary) {
+  const credentialLabel = log?.credentialLabel || (log?.attempts || []).find((attempt) => attempt.credentialLabel)?.credentialLabel || '-'
+  const attemptCount = Array.isArray(log?.attempts) ? log.attempts.length : 0
+  return `
+    <div><span>状态</span><strong>${escapeHtml(summary.code)} · ${escapeHtml(summary.title)}</strong></div>
+    <div><span>线路 / Key</span><strong>${escapeHtml(log?.providerName || '-')} / ${escapeHtml(credentialLabel)}</strong></div>
+    <div><span>模型</span><strong>${escapeHtml(log?.model || '-')}</strong></div>
+    <div><span>耗时</span><strong>${escapeHtml(log?.durationMs ?? '-')} ms</strong></div>
+    <div><span>尝试次数</span><strong>${attemptCount || '-'}</strong></div>
+    <div><span>时间</span><strong>${escapeHtml(log?.time ? new Date(log.time).toLocaleString() : '-')}</strong></div>
+  `
+}
+
+async function copyErrorDetail() {
+  const text = state.selectedErrorDetail || $('#errorDetailText')?.textContent || ''
+  if (!text) {
+    toast('没有可复制的失败详情')
+    return
+  }
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text)
+    } else {
+      const range = document.createRange()
+      range.selectNodeContents($('#errorDetailText'))
+      const selection = window.getSelection()
+      selection.removeAllRanges()
+      selection.addRange(range)
+      document.execCommand('copy')
+      selection.removeAllRanges()
+    }
+    toast('失败原因已复制')
+  } catch {
+    toast('复制失败，请手动选中详情')
+  }
+}
+
+async function runAiDiagnosis() {
+  const log = state.selectedErrorLog
+  if (!log) {
+    toast('请先打开一条请求失败详情')
+    return
+  }
+  const configured = state.config?.service?.diagnosticsLlm
+  if (!configured?.enabled || !configured?.baseUrl || !configured?.model || !configured?.apiKeySet) {
+    toast('请先在设置中配置并启用 AI 诊断模型')
+    return
+  }
+
+  const button = $('#runAiDiagnosisBtn')
+  button.disabled = true
+  state.aiDiagnosis = { loading: true }
+  renderAiDiagnosis()
+  try {
+    state.aiDiagnosis = await api('/api/diagnostics/ai', {
+      method: 'POST',
+      body: { log },
+    })
+    toast('AI 错误诊断已完成')
+  } catch (error) {
+    state.aiDiagnosis = { error: error.message || 'AI 诊断失败' }
+  } finally {
+    button.disabled = false
+    renderAiDiagnosis()
+  }
+}
+
+async function copyAiDiagnosis() {
+  const result = state.aiDiagnosis?.result
+  if (!result) {
+    toast('暂时没有可复制的 AI 诊断')
+    return
+  }
+  const text = formatAiDiagnosisForCopy(result)
+  try {
+    await navigator.clipboard.writeText(text)
+    toast('AI 诊断已复制')
+  } catch {
+    toast('复制失败，请手动选中诊断内容')
+  }
+}
+
+function renderAiDiagnosis() {
+  const panel = $('#aiDiagnosisPanel')
+  const resultNode = $('#aiDiagnosisResult')
+  const statusNode = $('#aiDiagnosisStatus')
+  const copyButton = $('#copyAiDiagnosisBtn')
+  if (!panel || !resultNode || !statusNode || !copyButton) return
+
+  const diagnosis = state.aiDiagnosis
+  panel.hidden = !diagnosis
+  copyButton.hidden = !diagnosis?.result
+  if (!diagnosis) {
+    resultNode.innerHTML = ''
+    statusNode.textContent = '等待诊断'
+    return
+  }
+  if (diagnosis.loading) {
+    statusNode.textContent = '正在分析'
+    resultNode.innerHTML = '<div class="ai-diagnosis-loading">正在整理请求日志并等待诊断模型返回……</div>'
+    return
+  }
+  if (diagnosis.error) {
+    statusNode.textContent = '诊断失败'
+    resultNode.innerHTML = `<div class="ai-diagnosis-error">${escapeHtml(diagnosis.error)}</div>`
+    return
+  }
+
+  const result = diagnosis.result || {}
+  statusNode.textContent = `${diagnosis.model || '诊断模型'} · ${diagnosis.latencyMs || 0} ms`
+  resultNode.innerHTML = aiDiagnosisMarkup(result)
+}
+
+function aiDiagnosisMarkup(result) {
+  if (result.format === 'text') {
+    return `
+      <div class="ai-diagnosis-summary">
+        <strong>${escapeHtml(result.summary || '模型返回了文本诊断')}</strong>
+        <span>未按结构化 JSON 返回</span>
+      </div>
+      <pre class="ai-diagnosis-raw">${escapeHtml(result.answer || '')}</pre>
+    `
+  }
+
+  const evidence = Array.isArray(result.evidence) ? result.evidence : []
+  const actions = Array.isArray(result.actions) ? result.actions : []
+  return `
+    <div class="ai-diagnosis-summary">
+      <strong>${escapeHtml(result.summary || '无法确定')}</strong>
+      <span>${escapeHtml(result.category || '未知')} · 置信度 ${escapeHtml(percentText(Number(result.confidence || 0) * 100, 100))}</span>
+    </div>
+    <div class="ai-diagnosis-grid">
+      <div><span>最可能原因</span><strong>${escapeHtml(result.rootCause || '无法确定')}</strong></div>
+      <div><span>故障转移判断</span><strong>${escapeHtml(result.failoverAssessment || '无法判断')}</strong></div>
+      <div class="wide"><span>证据</span>${evidence.length ? `<ul>${evidence.map((item) => `<li>${escapeHtml(item)}</li>`).join('')}</ul>` : '<strong>没有提供额外证据</strong>'}</div>
+      <div class="wide"><span>建议操作</span>${actions.length ? `<ol>${actions.map((item) => `<li><b>${escapeHtml(item.priority || '中')}</b>${escapeHtml(item.action || '')}</li>`).join('')}</ol>` : '<strong>暂无具体操作建议</strong>'}</div>
+      <div class="wide"><span>重试建议</span><strong>${escapeHtml(result.retryAdvice || '无法确定')}</strong></div>
+    </div>
+  `
+}
+
+function formatAiDiagnosisForCopy(result) {
+  if (result.format === 'text') return result.answer || result.summary || ''
+  const lines = [
+    `结论：${result.summary || '无法确定'}`,
+    `分类：${result.category || '未知'}`,
+    `置信度：${percentText(Number(result.confidence || 0) * 100, 100)}`,
+    `最可能原因：${result.rootCause || '无法确定'}`,
+    `故障转移判断：${result.failoverAssessment || '无法判断'}`,
+    '',
+    '证据：',
+    ...(result.evidence || []).map((item) => `- ${item}`),
+    '',
+    '建议操作：',
+    ...(result.actions || []).map((item) => `- [${item.priority || '中'}] ${item.action || ''}`),
+    '',
+    `重试建议：${result.retryAdvice || '无法确定'}`,
+  ]
+  return lines.join('\n')
+}
+
+function formatLogErrorDetail(log) {
+  const lines = []
+  const summary = compactLogErrorSummary(log)
+  appendDetailLine(lines, '状态摘要', summary ? `${summary.code} · ${summary.title}` : logStatusText(log))
+  appendDetailLine(lines, '时间', log?.time ? new Date(log.time).toLocaleString() : '')
+  appendDetailLine(lines, '请求', `${log?.method || ''} ${log?.path || ''}`.trim())
+  appendDetailLine(lines, '模型', log?.model)
+  appendDetailLine(lines, '路由模型', log?.routedModel)
+  appendDetailLine(lines, '线路', log?.providerName)
+  appendDetailLine(lines, 'Key 分组', log?.credentialLabel)
+  appendDetailLine(lines, 'HTTP 状态', log?.status ? `HTTP ${log.status}` : '')
+  appendDetailLine(lines, '结果', log?.outcome || (log?.ok ? 'success' : 'failed'))
+  appendDetailLine(lines, '耗时', log?.durationMs !== undefined ? `${log.durationMs} ms` : '')
+  appendDetailLine(lines, '错误', log?.error)
+
+  const diagnostics = prioritizeDiagnostics(Array.isArray(log?.diagnostics)
+    ? log.diagnostics.filter((item) => item && typeof item === 'object')
+    : [])
+  if (diagnostics.length) {
+    lines.push('', '诊断')
+    diagnostics.forEach((diagnostic, index) => appendDiagnosticLines(lines, diagnostic, index + 1))
+  }
+
+  const attempts = Array.isArray(log?.attempts) ? log.attempts : []
+  if (attempts.length) {
+    lines.push('', '尝试链')
+    attempts.forEach((attempt, index) => appendAttemptLines(lines, attempt, index + 1))
+  }
+
+  return redactSensitiveText(lines.join('\n').trim() || '没有记录到更多失败详情。')
+}
+
+function appendDiagnosticLines(lines, diagnostic, index) {
+  lines.push(`#${index} ${diagnostic.providerName ? `${diagnostic.providerName} · ` : ''}${diagnostic.title || diagnostic.code || '诊断'}`)
+  appendDetailLine(lines, '  状态', diagnostic.status ? `HTTP ${diagnostic.status}` : '')
+  appendDetailLine(lines, '  代码', diagnostic.code)
+  appendDetailLine(lines, '  内容', diagnostic.message)
+  appendDetailLine(lines, '  建议', diagnostic.suggestion)
+}
+
+function appendAttemptLines(lines, attempt, index) {
+  const status = attempt.status ? `HTTP ${attempt.status}` : (attempt.skipped ? '跳过' : attempt.ok ? '成功' : '失败')
+  lines.push(`#${index} ${attempt.providerName || '未命名线路'} · ${status}`)
+  appendDetailLine(lines, '  Key 分组', attempt.credentialLabel)
+  appendDetailLine(lines, '  模型', attempt.model)
+  appendDetailLine(lines, '  协议', attempt.wireApi)
+  appendDetailLine(lines, '  结果', attempt.outcome || attempt.reason || attempt.message)
+  appendDetailLine(lines, '  耗时', attempt.latencyMs !== undefined ? `${attempt.latencyMs} ms` : '')
+  appendDetailLine(lines, '  错误', attempt.error)
+  if (attempt.diagnostic && typeof attempt.diagnostic === 'object') appendDiagnosticLines(lines, attempt.diagnostic, `${index}.诊断`)
+}
+
+function appendDetailLine(lines, label, value) {
+  if (value === null || value === undefined || value === '') return
+  const text = typeof value === 'object' ? JSON.stringify(value, null, 2) : String(value)
+  if (!text.trim()) return
+  lines.push(`${label}: ${text}`)
+}
+
+function redactSensitiveText(value) {
+  return String(value || '')
+    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, 'Bearer [REDACTED]')
+    .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/g, 'sk-[REDACTED]')
+    .replace(/((?:api[_-]?key|access[_-]?token|authorization)["'\s:=]+)[^\s"',}]+/gi, '$1[REDACTED]')
+    .replace(/(https?:\/\/)([^:\s/@]+):([^@\s/]+)@/gi, '$1[REDACTED]@')
 }
 
 function logDiagnosticsMarkup(log, limit = 3) {
@@ -2474,6 +3473,7 @@ function nextProviderPriority() {
 function providerPatch(provider, priority = provider.priority) {
   return {
     name: provider.name,
+    groupId: providerGroupId(provider),
     baseUrl: provider.baseUrl,
     credentials: (provider.credentials || []).map((credential) => ({
       id: credential.id,
@@ -2494,6 +3494,7 @@ function providerPatch(provider, priority = provider.priority) {
     models: provider.models || [],
     tags: provider.tags || [],
     notes: provider.notes || '',
+    capabilities: provider.capabilities || {},
     enabled: provider.enabled,
   }
 }
@@ -2522,6 +3523,12 @@ function providerWebsiteUrl(baseUrl) {
 
 function preferredRealTestModel(provider) {
   const models = availableProviderModels(provider)
+  return preferredTestModel(models)
+}
+
+function preferredTestModel(models = []) {
+  if (models.includes('gpt-5.6-luna')) return 'gpt-5.6-luna'
+  if (models.includes('gpt-5.4-mini')) return 'gpt-5.4-mini'
   return models.find((model) => /mini|flash|lite|small/i.test(model)) || models[0] || ''
 }
 
@@ -2546,6 +3553,7 @@ function providerProxyLabel(provider) {
 }
 
 function routingModeLabel(mode) {
+  if (mode === 'pinned') return '单线锁定'
   return mode === 'locked' ? '锁定起点' : '自动推进'
 }
 

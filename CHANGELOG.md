@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.0 - 2026-07-14
+
+- Added provider-group management with OpenAI and DeepSeek defaults, group-aware
+  provider editing, migration coverage, and group CRUD regression tests.
+- Added route-level real testing with per-provider attempts, latency, and
+  failover results, plus session-affinity and routing-state coverage.
+- Added structured AI diagnostics configuration and redacted diagnostic tests.
+- Added incremental stream transformation and runtime-state checks for Codex
+  Responses compatibility.
+- Updated the public configuration example to the current version 3 schema.
+
 ## 0.3.0 - 2026-07-12
 
 - Added actionable per-request diagnostics for disabled or unavailable keys,

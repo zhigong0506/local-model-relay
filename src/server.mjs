@@ -1,14 +1,15 @@
 import { createServer } from 'node:http'
-import { createReadStream, existsSync } from 'node:fs'
+import { createReadStream, existsSync, readdirSync, statSync } from 'node:fs'
 import { extname, isAbsolute, join, relative, resolve } from 'node:path'
 import { ConfigStore, HttpError, resolveActiveCredential, resolveActiveKey } from './config-store.mjs'
 import { getCachedSystemProxy, getOutboundRuntime } from './outbound-proxy.mjs'
 import { StateStore } from './state-store.mjs'
 import { handleProxyRequest } from './proxy.mjs'
 import { publicDir, rootDir } from './paths.mjs'
-import { previewRoute, realTestProvider, syncProviderCredentialUsage, testProvider } from './provider-test.mjs'
+import { codexCompatibilityTestProvider, previewRoute, realTestProvider, realTestRoute, testProvider } from './provider-test.mjs'
 import { fetchSpeedTestModels, runSpeedTest } from './speed-test.mjs'
 import { describeRoutingSkip, describeUpstreamFailure, redactSecretText } from './upstream-diagnostics.mjs'
+import { diagnoseLog, testDiagnosticsLlm } from './diagnostics-llm.mjs'
 
 const configStore = new ConfigStore()
 const stateStore = new StateStore()
@@ -17,6 +18,9 @@ const runtimeListenHost = normalizeRuntimeHost(process.env.LOCAL_MODEL_RELAY_HOS
 const runtimeListenPort = normalizeRuntimePort(process.env.LOCAL_MODEL_RELAY_PORT, runtimeConfig.service.listenPort)
 stateStore.pruneProviders(runtimeConfig.providers.map((provider) => provider.id))
 const MAX_ADMIN_BODY_BYTES = 2 * 1024 * 1024
+const RUNTIME_PROTOCOL_VERSION = 1
+const SERVER_STARTED_AT_MS = Date.now()
+const SERVER_STARTED_AT = new Date(SERVER_STARTED_AT_MS).toISOString()
 
 const server = createServer(async (req, res) => {
   try {
@@ -94,6 +98,10 @@ async function routeRequest(req, res) {
     return sendJson(res, 200, runtimeState())
   }
 
+  if (url.pathname === '/api/state/summary' && req.method === 'GET') {
+    return sendJson(res, 200, runtimeSummaryState())
+  }
+
   if (url.pathname === '/api/state/logs' && req.method === 'DELETE') {
     stateStore.clearRequestLog()
     return sendJson(res, 200, runtimeState())
@@ -102,6 +110,17 @@ async function routeRequest(req, res) {
   if (url.pathname === '/api/state/usage' && req.method === 'DELETE') {
     stateStore.clearUsage()
     return sendJson(res, 200, runtimeState())
+  }
+
+  if (url.pathname === '/api/diagnostics/ai' && req.method === 'POST') {
+    const config = configStore.get()
+    const body = await readJson(req)
+    return sendJson(res, 200, await diagnoseLog(body.log, config.service))
+  }
+
+  if (url.pathname === '/api/diagnostics/ai/test' && req.method === 'POST') {
+    const config = configStore.get()
+    return sendJson(res, 200, await testDiagnosticsLlm(config.service))
   }
 
   if (url.pathname === '/api/speed-test/models' && req.method === 'POST') {
@@ -117,11 +136,18 @@ async function routeRequest(req, res) {
   if (url.pathname === '/api/routing/start' && req.method === 'POST') {
     const body = await readJson(req)
     const providerId = String(body.providerId || '').trim()
+    const mode = typeof body.mode === 'string' ? body.mode.trim().toLowerCase() : ''
     const config = configStore.get()
+    if (body.mode !== undefined && !['auto', 'locked', 'pinned'].includes(mode)) {
+      throw new HttpError(400, 'invalid_routing_mode', 'Routing mode must be auto, locked, or pinned.')
+    }
     if (providerId && !config.providers.some((provider) => provider.id === providerId)) {
       throw new HttpError(404, 'provider_not_found', 'Provider not found.')
     }
-    stateStore.setStartProvider(providerId, body.mode)
+    if (mode === 'pinned' && !providerId) {
+      throw new HttpError(400, 'pinned_start_required', 'Choose a start provider before enabling pinned routing.')
+    }
+    stateStore.setStartProvider(providerId, body.mode === undefined ? undefined : mode)
     return sendJson(res, 200, runtimeState())
   }
 
@@ -137,6 +163,18 @@ async function routeRequest(req, res) {
   if (url.pathname === '/api/service/enabled' && req.method === 'POST') {
     const body = await readJson(req)
     return sendJson(res, 200, configStore.setEnabled(Boolean(body.enabled)))
+  }
+
+  if (url.pathname === '/api/provider-groups' && req.method === 'POST') {
+    return sendJson(res, 201, configStore.createProviderGroup(await readJson(req)))
+  }
+
+  const providerGroupMatch = url.pathname.match(/^\/api\/provider-groups\/([^/]+)$/)
+  if (providerGroupMatch && req.method === 'PATCH') {
+    return sendJson(res, 200, configStore.updateProviderGroup(providerGroupMatch[1], await readJson(req)))
+  }
+  if (providerGroupMatch && req.method === 'DELETE') {
+    return sendJson(res, 200, configStore.deleteProviderGroup(providerGroupMatch[1]))
   }
 
   if (url.pathname === '/api/providers' && req.method === 'POST') {
@@ -179,17 +217,32 @@ async function routeRequest(req, res) {
     return sendJson(res, 200, result)
   }
 
-  const providerUsageSyncMatch = url.pathname.match(/^\/api\/providers\/([^/]+)\/usage-sync$/)
-  if (providerUsageSyncMatch && req.method === 'POST') {
+  const providerCodexTestMatch = url.pathname.match(/^\/api\/providers\/([^/]+)\/codex-test$/)
+  if (providerCodexTestMatch && req.method === 'POST') {
     const config = configStore.get()
-    const provider = config.providers.find((item) => item.id === providerUsageSyncMatch[1])
+    const provider = config.providers.find((item) => item.id === providerCodexTestMatch[1])
     if (!provider) throw new HttpError(404, 'provider_not_found', 'Provider not found.')
-    const result = await syncProviderCredentialUsage(provider, await readJson(req), config.service)
-    if (result.ok && result.snapshot) {
-      result.upstreamUsage = stateStore.recordUpstreamUsage(provider.id, result.credentialId, result.snapshot)
-      result.provider = configStore.updateCredentialMetadata(provider.id, result.credentialId, {
-        upstreamGroup: result.snapshot.group,
-        upstreamStatus: result.snapshot.status,
+    const result = await codexCompatibilityTestProvider(provider, await readJson(req), config.service)
+    if (!result.skipped) {
+      const current = provider.capabilities && typeof provider.capabilities === 'object' ? provider.capabilities : {}
+      const codex = current.codex && typeof current.codex === 'object' ? current.codex : {}
+      const models = codex.models && typeof codex.models === 'object' ? codex.models : {}
+      result.provider = configStore.updateProviderCapabilities(provider.id, {
+        ...current,
+        codex: {
+          ...codex,
+          models: {
+            ...models,
+            [result.model]: {
+              status: result.ok ? 'verified' : 'failed',
+              checkedAt: new Date().toISOString(),
+              credentialId: result.credentialId || provider.activeCredentialId || '',
+              wireApi: 'responses',
+              message: result.message || '',
+              checks: result.checks || {},
+            },
+          },
+        },
       })
     }
     return sendJson(res, 200, result)
@@ -197,6 +250,20 @@ async function routeRequest(req, res) {
 
   if (url.pathname === '/api/routes' && req.method === 'POST') {
     return sendJson(res, 201, configStore.createRoute(await readJson(req)))
+  }
+
+  const routeRealTestMatch = url.pathname.match(/^\/api\/routes\/([^/]+)\/real-test$/)
+  if (routeRealTestMatch && req.method === 'POST') {
+    const config = configStore.get()
+    const route = config.routes.find((item) => item.id === routeRealTestMatch[1])
+    if (!route) throw new HttpError(404, 'route_not_found', 'Route not found.')
+    if (!route.enabled) throw new HttpError(409, 'route_disabled', 'Enable this model route before running a route test.')
+    const result = await realTestRoute(config, stateStore, {
+      ...(await readJson(req)),
+      model: route.virtualModel,
+    }, config.service)
+    recordRouteTestResult(result)
+    return sendJson(res, 200, result)
   }
 
   const routeMatch = url.pathname.match(/^\/api\/routes\/([^/]+)$/)
@@ -411,6 +478,80 @@ function recordProviderTestResult(provider, result) {
   }, config.service.requestLogLimit)
 }
 
+function recordRouteTestResult(result) {
+  const config = configStore.get()
+  const attempts = Array.isArray(result?.attempts) ? result.attempts : []
+  const publicAttempts = attempts.map((attempt) => {
+    const provider = config.providers.find((item) => item.id === attempt.providerId)
+    const diagnostic = attempt.ok || attempt.skipped
+      ? null
+      : routeTestDiagnostic(provider, attempt)
+    const latencyMs = Number(attempt.latencyMs) || 0
+    if (provider && !attempt.skipped) {
+      if (attempt.ok) {
+        stateStore.markSuccess(provider.id, { status: attempt.status || 200, latencyMs })
+      } else {
+        stateStore.markFailure(provider.id, {
+          status: attempt.status || 0,
+          message: attempt.message || 'Route test failed.',
+          latencyMs,
+          cooldownSeconds: 0,
+        })
+      }
+    }
+    return {
+      providerId: attempt.providerId || '',
+      providerName: attempt.providerName || '',
+      credentialId: attempt.credentialId || '',
+      credentialLabel: attempt.credentialLabel || '',
+      model: attempt.model || '',
+      status: attempt.status || 0,
+      latencyMs,
+      error: attempt.ok ? null : attempt.message || 'Route test failed.',
+      outcome: attempt.ok ? 'route_test_success' : attempt.skipped ? 'route_test_skipped' : 'route_test_failed',
+      diagnostic,
+    }
+  })
+
+  if (!config.service.logRequests) return
+  const finalProvider = config.providers.find((item) => item.id === result.providerId)
+  const finalDiagnostic = result.ok
+    ? null
+    : routeTestDiagnostic(finalProvider, result)
+  stateStore.addRequestLog({
+    testType: 'route_test',
+    method: 'TEST',
+    path: '/v1/route-test',
+    model: result.virtualModel || result.model || '',
+    routedModel: result.routedModel || '',
+    providerId: result.providerId || '',
+    providerName: result.providerName || '',
+    credentialId: result.credentialId || '',
+    credentialLabel: result.credentialLabel || '',
+    status: result.status || 0,
+    ok: Boolean(result.ok),
+    attempts: publicAttempts,
+    durationMs: Number(result.latencyMs) || 0,
+    outcome: result.ok ? 'route_test_success' : 'route_test_failed',
+    stream: false,
+    usage: result.ok ? result.usage : null,
+    error: result.ok ? undefined : result.message || 'Route test failed.',
+    diagnostics: [...publicAttempts.map((attempt) => attempt.diagnostic), finalDiagnostic].filter(Boolean),
+  }, config.service.requestLogLimit)
+}
+
+function routeTestDiagnostic(provider, result) {
+  if (result?.reason === 'no_credential') {
+    return describeRoutingSkip(provider || { id: '', name: result.providerName || '未命名线路' }, 'no_enabled_key', result.model || '')
+  }
+  return describeUpstreamFailure(
+    result?.status,
+    result?.message || 'Route test failed.',
+    result?.reason || 'upstream_error',
+    { timedOut: result?.reason === 'local_timeout' },
+  )
+}
+
 function testDiagnostic(provider, result) {
   if (!result || result.ok) return null
   if (result.reason === 'no_credential') {
@@ -448,7 +589,50 @@ function runtimeState() {
   return {
     ...stateStore.getPublic(),
     outbound: currentOutboundRuntime(config.service),
+    runtimeMeta: runtimeMeta(),
   }
+}
+
+function runtimeSummaryState() {
+  const config = configStore.get()
+  return {
+    ...stateStore.getSummary(),
+    outbound: currentOutboundRuntime(config.service),
+    runtimeMeta: runtimeMeta(),
+  }
+}
+
+function runtimeMeta() {
+  const backendSourceUpdatedAtMs = latestBackendSourceUpdatedAt()
+  return {
+    protocolVersion: RUNTIME_PROTOCOL_VERSION,
+    serverStartedAt: SERVER_STARTED_AT,
+    backendSourceUpdatedAt: backendSourceUpdatedAtMs
+      ? new Date(backendSourceUpdatedAtMs).toISOString()
+      : null,
+    restartRequired: backendSourceUpdatedAtMs > SERVER_STARTED_AT_MS,
+  }
+}
+
+function latestBackendSourceUpdatedAt() {
+  const files = [join(rootDir, 'scripts', 'launch-server.mjs')]
+  try {
+    for (const entry of readdirSync(join(rootDir, 'src'), { withFileTypes: true })) {
+      if (entry.isFile() && entry.name.endsWith('.mjs')) files.push(join(rootDir, 'src', entry.name))
+    }
+  } catch {
+    return 0
+  }
+
+  let latest = 0
+  for (const filePath of files) {
+    try {
+      latest = Math.max(latest, statSync(filePath).mtimeMs)
+    } catch {
+      // A source file may be replaced atomically while this check is running.
+    }
+  }
+  return latest
 }
 
 function currentOutboundRuntime(service) {

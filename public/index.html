@@ -35,6 +35,15 @@
     </header>
 
     <main>
+      <section id="runtimeNotice" class="runtime-notice" role="alert" hidden>
+        <div class="runtime-notice-icon" aria-hidden="true">!</div>
+        <div class="runtime-notice-copy">
+          <strong id="runtimeNoticeTitle">页面与后台版本不一致</strong>
+          <span id="runtimeNoticeText">请重新启动 Local Model Relay。</span>
+        </div>
+        <button id="runtimeCheckBtn" class="ghost" type="button">↻ 重新检测</button>
+      </section>
+
       <section class="status-band">
         <div>
           <span class="label">本地接口</span>
@@ -157,9 +166,12 @@
           <div class="panel-head">
             <div>
               <h2>中转线路</h2>
-              <p>按优先级从小到大尝试，失败后自动进入短冷却。</p>
+              <p>按业务分组管理线路；实际故障转移仍按全局优先级从小到大执行。</p>
             </div>
-            <button id="newProviderBtn" class="primary" type="button">新增线路</button>
+            <div class="panel-tools">
+              <button id="manageProviderGroupsBtn" class="ghost" type="button">管理分组</button>
+              <button id="newProviderBtn" class="primary" type="button">新增线路</button>
+            </div>
           </div>
           <div id="routingBar" class="routing-bar">
             <div>
@@ -173,10 +185,15 @@
                 <select id="routingStartMode" class="inline-select">
                   <option value="auto">自动推进</option>
                   <option value="locked">锁定起点</option>
+                  <option value="pinned">单线锁定（不故障转移）</option>
                 </select>
               </label>
               <button id="clearStartProviderBtn" class="ghost" type="button">清除起点</button>
             </div>
+          </div>
+          <div class="provider-group-bar">
+            <div id="providerGroupTabs" class="provider-group-tabs" role="tablist" aria-label="线路分组"></div>
+            <div id="providerGroupSummary" class="provider-group-summary"></div>
           </div>
           <div id="providerEmptyGuide" class="onboarding" hidden>
             <div><strong>1</strong><span>新增中转站，填入 Base URL 与 API Key。</span></div>
@@ -185,13 +202,24 @@
             <button id="quickProviderBtn" class="ghost" type="button">开始新增</button>
           </div>
           <div class="table-wrap">
-            <table>
+            <table class="providers-table">
+              <colgroup>
+                <col class="provider-status-col">
+                <col class="provider-name-col">
+                <col class="provider-url-col">
+                <col class="provider-credential-col">
+                <col class="provider-models-col">
+                <col class="provider-priority-col">
+                <col class="provider-stats-col">
+                <col class="provider-recent-col">
+                <col class="provider-actions-col">
+              </colgroup>
               <thead>
                 <tr>
                   <th>状态</th>
                   <th>名称</th>
                   <th>Base URL</th>
-                  <th>当前分组</th>
+                  <th>当前 Key</th>
                   <th>模型</th>
                   <th>优先级</th>
                   <th>统计</th>
@@ -373,8 +401,74 @@
               <span>重连切线冷却秒数</span>
               <input name="reconnectCooldownSeconds" type="number" min="30" max="10800">
             </label>
+            <section class="session-affinity-card wide">
+              <div class="section-head">
+                <strong>会话线路亲和</strong>
+                <span>同一任务优先回到此前成功的线路</span>
+              </div>
+              <label class="checkline">
+                <input name="sessionAffinity" type="checkbox">
+                <span>启用会话线路亲和</span>
+              </label>
+              <label class="checkline">
+                <input name="capabilityRouting" type="checkbox">
+                <span>Codex 仅走已验证线路</span>
+                <small>开启后，`/v1/responses` 会跳过未通过对应模型 Codex 验证的线路。</small>
+              </label>
+              <div class="two">
+                <label>
+                  <span>绑定有效期（秒）</span>
+                  <input name="sessionTtlSeconds" type="number" min="300" max="604800">
+                </label>
+                <label>
+                  <span>最大会话绑定数</span>
+                  <input name="sessionLimit" type="number" min="50" max="10000">
+                </label>
+              </div>
+              <small class="field-hint">支持专用会话标识和 Responses 的 previous_response_id；绑定线路不可用时会自动回退到普通路由。</small>
+            </section>
+            <section class="ai-diagnostics-card wide">
+              <div class="section-head">
+                <strong>AI 错误诊断</strong>
+                <span>只发送筛选后的请求日志，不发送请求正文和线路 Key</span>
+              </div>
+              <label class="checkline">
+                <input name="diagnosticsLlmEnabled" type="checkbox">
+                <span>启用 AI 错误诊断</span>
+              </label>
+              <div class="two">
+                <label>
+                  <span>诊断接口 URL</span>
+                  <input name="diagnosticsLlmBaseUrl" autocomplete="off" placeholder="https://example.com/v1">
+                  <small class="field-hint">支持 OpenAI-compatible Chat Completions；可填写根地址、/v1 或完整 /chat/completions。</small>
+                </label>
+                <label>
+                  <span>诊断模型</span>
+                  <input name="diagnosticsLlmModel" autocomplete="off" placeholder="gpt-4o-mini">
+                </label>
+              </div>
+              <label class="secret-field">
+                <span>诊断 API Key</span>
+                <div class="secret-row diagnostics-key-row">
+                  <input name="diagnosticsLlmApiKey" type="password" autocomplete="new-password" placeholder="留空则保留已保存的 Key">
+                  <button id="toggleDiagnosticsKeyBtn" class="ghost" type="button">显示</button>
+                  <button id="clearDiagnosticsKeyBtn" class="ghost" type="button">清除</button>
+                </div>
+                <small id="diagnosticsKeyStatus" class="field-hint">尚未配置 Key</small>
+              </label>
+              <div class="diagnostics-settings-row">
+                <label>
+                  <span>诊断超时（秒）</span>
+                  <input name="diagnosticsLlmTimeoutSeconds" type="number" min="5" max="120" step="1">
+                </label>
+                <div class="diagnostics-settings-actions">
+                  <button id="testDiagnosticsLlmBtn" class="ghost" type="button">测试诊断接口</button>
+                  <span id="diagnosticsLlmStatus" class="inline-hint">保存设置后才会使用。</span>
+                </div>
+              </div>
+            </section>
             <label class="wide">
-              <span>可切换 HTTP 状态码</span>
+              <span>可切换 HTTP 状态码（已包含 520–524）</span>
               <input name="retryStatusCodes" autocomplete="off">
             </label>
             <section class="outbound-card wide">
@@ -652,10 +746,16 @@
           <button class="icon-btn close-dialog" type="button" title="关闭" aria-label="关闭">×</button>
         </div>
         <input name="id" type="hidden">
-        <label>
-          <span>名称</span>
-          <input name="name" required autocomplete="off">
-        </label>
+        <div class="two">
+          <label>
+            <span>名称</span>
+            <input name="name" required autocomplete="off">
+          </label>
+          <label>
+            <span>线路分组</span>
+            <select name="groupId" required></select>
+          </label>
+        </div>
         <label>
           <span>Base URL</span>
           <input name="baseUrl" required placeholder="https://example.com" autocomplete="off">
@@ -740,11 +840,56 @@
           <input name="enabled" type="checkbox">
           <span>启用线路</span>
         </label>
+        <section id="providerDangerZone" class="danger-zone" hidden>
+          <div>
+            <strong>危险操作</strong>
+            <small>删除后会同时移除这条线路在模型路由中的目标。</small>
+          </div>
+          <button id="deleteProviderBtn" class="danger" type="button">删除此线路</button>
+        </section>
         <div class="form-actions">
           <button class="primary" type="submit">保存</button>
           <button type="button" class="ghost close-dialog">取消</button>
         </div>
       </form>
+    </dialog>
+
+    <dialog id="providerGroupsDialog" class="provider-groups-dialog">
+      <div class="dialog-body">
+        <div class="dialog-head">
+          <div>
+            <h2>管理线路分组</h2>
+            <p>分组只负责整理线路，不会改变模型路由和故障转移顺序。</p>
+          </div>
+          <button class="icon-btn close-dialog" type="button" title="关闭" aria-label="关闭">×</button>
+        </div>
+        <div id="providerGroupRows" class="provider-group-rows"></div>
+        <form id="providerGroupForm" class="provider-group-editor">
+          <input name="id" type="hidden">
+          <div class="section-head">
+            <strong id="providerGroupEditorTitle">新增分组</strong>
+            <button id="resetProviderGroupFormBtn" class="ghost" type="button">清空</button>
+          </div>
+          <div class="provider-group-editor-grid">
+            <label>
+              <span>分组名称</span>
+              <input name="name" required autocomplete="off" placeholder="例如 Claude、Gemini">
+            </label>
+            <label>
+              <span>识别颜色</span>
+              <input name="color" type="color" value="#667085">
+            </label>
+          </div>
+          <label>
+            <span>分组说明</span>
+            <input name="description" maxlength="240" autocomplete="off" placeholder="说明这个分组主要放哪些线路">
+          </label>
+          <div class="form-actions">
+            <button class="primary" type="submit">保存分组</button>
+            <button type="button" class="ghost close-dialog">完成</button>
+          </div>
+        </form>
+      </div>
     </dialog>
 
     <dialog id="realTestDialog" class="real-test-dialog">
@@ -786,9 +931,57 @@
           <textarea name="prompt" rows="3">Reply with exactly: OK</textarea>
         </label>
         <div id="realTestTimeoutHint" class="test-timeout-hint"></div>
+        <div class="real-test-tools">
+          <div>
+            <strong>Codex 兼容性验证</strong>
+            <small>使用当前选中的模型和 Key，检查 Responses 文本流与函数调用流。</small>
+          </div>
+          <button id="runCodexTestBtn" class="ghost" type="button">运行 Codex 验证</button>
+        </div>
+        <div id="codexTestResult" class="codex-test-result empty">尚未运行 Codex 兼容性验证。</div>
         <div id="realTestResult" class="real-test-result empty">尚未运行真实转发测试。</div>
         <div class="form-actions">
           <button id="runRealTestBtn" class="primary" type="submit">运行测试</button>
+          <button type="button" class="ghost close-dialog">取消</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="routeTestDialog" class="route-test-dialog">
+      <form id="routeTestForm" method="dialog" class="dialog-body">
+        <div class="dialog-head">
+          <h2 id="routeTestDialogTitle">模型路由测试</h2>
+          <button class="icon-btn close-dialog" type="button" title="关闭" aria-label="关闭">×</button>
+        </div>
+        <input name="routeId" type="hidden">
+        <section class="route-test-overview">
+          <div>
+            <span class="label">虚拟模型</span>
+            <strong id="routeTestVirtualModel">-</strong>
+          </div>
+          <div>
+            <span class="label">测试方式</span>
+            <strong>按当前路由顺序真实请求</strong>
+          </div>
+          <div class="wide">
+            <span class="label">候选线路</span>
+            <div id="routeTestCandidates" class="route-test-candidates">-</div>
+          </div>
+        </section>
+        <div class="two">
+          <label>
+            <span>最大输出 token</span>
+            <input name="maxTokens" type="number" min="1" max="128" value="8">
+          </label>
+          <div class="test-timeout-hint">按每条线路的实际协议和 Key 分组发送请求，逐条记录命中和耗时。</div>
+        </div>
+        <label>
+          <span>测试提示词</span>
+          <textarea name="prompt" rows="3">Reply with exactly: OK</textarea>
+        </label>
+        <div id="routeTestResult" class="route-test-result empty">尚未运行模型路由测试。</div>
+        <div class="form-actions">
+          <button id="runRouteTestBtn" class="primary" type="submit">运行路由测试</button>
           <button type="button" class="ghost close-dialog">取消</button>
         </div>
       </form>
@@ -820,6 +1013,32 @@
           <button type="button" class="ghost close-dialog">取消</button>
         </div>
       </form>
+    </dialog>
+
+    <dialog id="errorDetailDialog" class="error-detail-dialog">
+      <div class="dialog-body">
+        <div class="dialog-head">
+          <h2 id="errorDetailTitle">失败详情</h2>
+          <button class="icon-btn close-dialog" type="button" title="关闭" aria-label="关闭">×</button>
+        </div>
+        <div id="errorDetailSummary" class="error-detail-summary"></div>
+        <pre id="errorDetailText" class="error-detail-text"></pre>
+        <section id="aiDiagnosisPanel" class="ai-diagnosis-panel" hidden>
+          <div class="ai-diagnosis-head">
+            <div>
+              <strong>AI 诊断</strong>
+              <span id="aiDiagnosisStatus">等待诊断</span>
+            </div>
+            <button id="copyAiDiagnosisBtn" class="ghost" type="button" hidden>复制诊断</button>
+          </div>
+          <div id="aiDiagnosisResult" class="ai-diagnosis-result"></div>
+        </section>
+        <div class="form-actions">
+          <button id="copyErrorDetailBtn" class="primary" type="button">复制原因</button>
+          <button id="runAiDiagnosisBtn" class="ghost" type="button">AI 诊断</button>
+          <button type="button" class="ghost close-dialog">关闭</button>
+        </div>
+      </div>
     </dialog>
 
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
