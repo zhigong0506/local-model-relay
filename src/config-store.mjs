@@ -34,9 +34,6 @@ export const DEFAULT_CONFIG = {
     requestLogLimit: 1500,
     outboundProxyMode: 'direct',
     outboundProxyUrl: '',
-    // Off by default so existing routes remain backward compatible until their
-    // providers have been explicitly verified with a real Codex Responses test.
-    capabilityRouting: false,
     diagnosticsLlm: {
       enabled: false,
       baseUrl: '',
@@ -602,7 +599,6 @@ function normalizeService(input) {
     requestLogLimit: clampInteger(input.requestLogLimit, 200, 3000, DEFAULT_CONFIG.service.requestLogLimit),
     outboundProxyMode: outboundProxyMode === 'custom' && !outboundProxyUrl ? 'direct' : outboundProxyMode,
     outboundProxyUrl,
-    capabilityRouting: input.capabilityRouting === true,
     diagnosticsLlm,
   }
 }

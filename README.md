@@ -22,6 +22,9 @@ It is a personal desktop tool, not a multi-user gateway or billing platform.
 - Same-request failover for retryable HTTP status codes and stream failures
 - Codex-compatible Responses text streams, function calls, tool results, and
   reconnect circuit breaking
+- Provider-isolated reasoning fallback from `max` to `xhigh` only when the
+  current upstream explicitly rejects `max`; later providers still receive the
+  original `max` request
 - Quick connectivity tests, model-aware real tests, and ad-hoc endpoint speed tests
 - Searchable model pickers for large speed-test and real-test model lists
 - Actionable request diagnostics for disabled keys, retry skips, common upstream

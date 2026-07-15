@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process'
 import { buildCandidates } from './proxy.mjs'
 import { resolveActiveCredential, resolveActiveKey } from './config-store.mjs'
 import { getCachedSystemProxy, resolveProviderOutboundProxy } from './outbound-proxy.mjs'
@@ -10,6 +11,9 @@ import {
   transformResponsePayload,
 } from './wire-api.mjs'
 import { upstreamFetch } from './upstream-fetch.mjs'
+
+const CODEX_HEADER_TEST_VERSION = '0.144.2'
+let cachedCodexCliVersion = ''
 
 export async function testProvider(provider, model = null, serviceConfig = {}) {
   const selectedModel = model || provider.models[0] || 'gpt-4o-mini'
@@ -86,32 +90,15 @@ export async function codexCompatibilityTestProvider(provider, input = {}, servi
     return skippedCodexTest({ selectedModel, reason: 'unsupported_model', message: 'The selected model is not in this provider supported model list.' })
   }
 
-  const text = await sendCodexResponses(testProvider, selectedModel, {
+  const codexHeaders = buildCodexTestHeaders(testProvider, normalizeText(input.codexVersion) || resolveLocalCodexVersion())
+  const response = await sendCodexResponses(testProvider, selectedModel, {
     model: selectedModel,
     stream: true,
-    input: 'Reply with exactly: CODEX_TEXT_OK',
+    input: 'Reply with exactly: CODEX_HEADER_OK',
     max_output_tokens: 16,
-  }, serviceConfig, timeoutMs)
-  const tool = text.ok ? await sendCodexResponses(testProvider, selectedModel, {
-    model: selectedModel,
-    stream: true,
-    input: 'Call diagnostic_ping with value ok.',
-    tools: [{
-      type: 'function',
-      name: 'diagnostic_ping',
-      description: 'Return a diagnostic pong.',
-      parameters: {
-        type: 'object',
-        properties: { value: { type: 'string' } },
-        required: ['value'],
-        additionalProperties: false,
-      },
-      strict: true,
-    }],
-    tool_choice: { type: 'function', name: 'diagnostic_ping' },
-  }, serviceConfig, timeoutMs) : skippedCodexTest({ selectedModel, reason: 'text_failed', message: 'Skipped tool-call check because text lifecycle failed.' })
+  }, serviceConfig, timeoutMs, codexHeaders)
 
-  const ok = text.ok && tool.ok
+  const ok = response.ok
   return {
     ok,
     status: ok ? 200 : tool.status || text.status || 0,
@@ -122,12 +109,17 @@ export async function codexCompatibilityTestProvider(provider, input = {}, servi
     latencyMs: Date.now() - startedAt,
     timeoutMs,
     checks: {
-      text: codexCheckSummary(text),
-      toolCall: codexCheckSummary(tool),
+      requestHeaders: {
+        ok: true,
+        userAgent: codexHeaders.get('user-agent') || '',
+        originator: codexHeaders.get('originator') || '',
+        version: codexHeaders.get('version') || '',
+      },
+      response: codexCheckSummary(response),
     },
     message: ok
-      ? 'Codex Responses text stream and forced function-call stream both passed.'
-      : tool.message || text.message || 'Codex compatibility test failed.',
+      ? 'Upstream accepted the Codex request headers and returned a valid Responses payload.'
+      : response.message || 'Codex request header verification failed.',
   }
 }
 
@@ -222,13 +214,13 @@ export async function realTestProvider(provider, input = {}, serviceConfig = {})
   }
 }
 
-async function sendCodexResponses(provider, model, body, serviceConfig, timeoutMs) {
+async function sendCodexResponses(provider, model, body, serviceConfig, timeoutMs, requestHeaders = null) {
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), timeoutMs)
   try {
     const requestUrl = '/v1/responses'
     const plan = buildWirePlan(requestUrl, provider)
-    const headers = buildAuthHeaders(provider)
+    const headers = requestHeaders || buildAuthHeaders(provider)
     headers.set('content-type', 'application/json')
     const response = await upstreamFetch(buildWireUrl(provider.baseUrl, requestUrl, plan), {
       method: 'POST',
@@ -264,6 +256,31 @@ async function sendCodexResponses(provider, model, body, serviceConfig, timeoutM
   } finally {
     clearTimeout(timeout)
   }
+}
+
+function buildCodexTestHeaders(provider, version) {
+  const headers = buildAuthHeaders(provider)
+  headers.set('user-agent', `codex_cli_rs/${version}`)
+  headers.set('originator', 'codex_cli_rs')
+  headers.set('version', version)
+  return headers
+}
+
+function resolveLocalCodexVersion() {
+  if (cachedCodexCliVersion) return cachedCodexCliVersion
+  try {
+    const executable = process.platform === 'win32' ? 'codex.cmd' : 'codex'
+    const output = execFileSync(executable, ['--version'], {
+      encoding: 'utf8',
+      timeout: 3000,
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    })
+    cachedCodexCliVersion = String(output).match(/\b(\d+\.\d+\.\d+)\b/)?.[1] || CODEX_HEADER_TEST_VERSION
+  } catch {
+    cachedCodexCliVersion = CODEX_HEADER_TEST_VERSION
+  }
+  return cachedCodexCliVersion
 }
 
 async function readCodexJson(response, plan) {

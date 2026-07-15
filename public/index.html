@@ -410,11 +410,6 @@
                 <input name="sessionAffinity" type="checkbox">
                 <span>启用会话线路亲和</span>
               </label>
-              <label class="checkline">
-                <input name="capabilityRouting" type="checkbox">
-                <span>Codex 仅走已验证线路</span>
-                <small>开启后，`/v1/responses` 会跳过未通过对应模型 Codex 验证的线路。</small>
-              </label>
               <div class="two">
                 <label>
                   <span>绑定有效期（秒）</span>
@@ -933,12 +928,12 @@
         <div id="realTestTimeoutHint" class="test-timeout-hint"></div>
         <div class="real-test-tools">
           <div>
-            <strong>Codex 兼容性验证</strong>
-            <small>使用当前选中的模型和 Key，检查 Responses 文本流与函数调用流。</small>
+            <strong>Codex 请求头验证</strong>
+            <small>使用当前模型和 Key 携带 Codex 客户端请求头，检查线路是否接受并返回有效响应。</small>
           </div>
-          <button id="runCodexTestBtn" class="ghost" type="button">运行 Codex 验证</button>
+          <button id="runCodexTestBtn" class="ghost" type="button">验证 Codex 请求头</button>
         </div>
-        <div id="codexTestResult" class="codex-test-result empty">尚未运行 Codex 兼容性验证。</div>
+        <div id="codexTestResult" class="codex-test-result empty">尚未运行 Codex 请求头验证。</div>
         <div id="realTestResult" class="real-test-result empty">尚未运行真实转发测试。</div>
         <div class="form-actions">
           <button id="runRealTestBtn" class="primary" type="submit">运行测试</button>

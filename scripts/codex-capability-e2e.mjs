@@ -35,10 +35,6 @@ try {
   const afterTest = await api('/api/config')
   const persisted = afterTest.providers.find((item) => item.id === verified.id)?.capabilities?.codex?.models?.[model]
 
-  await api('/api/service', {
-    method: 'PATCH',
-    body: { capabilityRouting: true },
-  })
   const relayResponse = await fetch(`${relay}/v1/responses`, {
     method: 'POST',
     headers: {
@@ -50,30 +46,25 @@ try {
   const text = await relayResponse.text()
   const state = await api('/api/state')
   const latest = state.requestLog[0]
-  const diagnostics = latest?.diagnostics || []
-
   const report = {
     ok: capability.ok &&
       persisted?.status === 'verified' &&
       relayResponse.status === 200 &&
       text.includes('CODEX_CAPABILITY_OK') &&
-      unverifiedHits === 0 &&
-      verifiedHits >= 3 &&
-      diagnostics.some((item) => item.code === 'provider_codex_unverified'),
+      unverifiedHits >= 1 &&
+      verifiedHits >= 1,
     capability,
     persisted,
     relay: {
       status: relayResponse.status,
       unverifiedHits,
       verifiedHits,
-      diagnosticCodes: diagnostics.map((item) => item.code),
       finalProvider: latest?.providerName,
     },
   }
   console.log(JSON.stringify(report, null, 2))
   if (!report.ok) process.exitCode = 1
 } finally {
-  await api('/api/service', { method: 'PATCH', body: { capabilityRouting: false } }).catch(() => {})
   for (const route of createdRoutes.reverse()) await api(`/api/routes/${route.id}`, { method: 'DELETE' }).catch(() => {})
   for (const provider of createdProviders.reverse()) await api(`/api/providers/${provider.id}`, { method: 'DELETE' }).catch(() => {})
   if (mock) await new Promise((resolve) => mock.close(resolve))
@@ -107,7 +98,7 @@ function startMock() {
     for await (const chunk of req) chunks.push(chunk)
     const body = JSON.parse(Buffer.concat(chunks).toString('utf8'))
     const isVerified = req.headers.authorization === 'Bearer verified-key'
-    const isTool = Array.isArray(body.tools) && body.tools.length > 0
+    const isHeaderProbe = body.input === 'Reply with exactly: CODEX_HEADER_OK'
     // The unverified provider is never expected to receive a routed request;
     // the capability probe only targets the verified one after its route order.
     if (req.url !== '/v1/responses') {
@@ -117,22 +108,22 @@ function startMock() {
     }
     res.statusCode = 200
     res.setHeader('content-type', 'text/event-stream; charset=utf-8')
-    if (isTool) {
-      if (isVerified) verifiedHits += 1
-      else unverifiedHits += 1
-      sse(res, 'response.created', { response: { id: `resp_${stamp}`, status: 'in_progress', output: [] } })
-      sse(res, 'response.function_call_arguments.delta', { response_id: `resp_${stamp}`, item_id: 'fc_1', output_index: 0, delta: '{"value":"ok"}' })
-      sse(res, 'response.function_call_arguments.done', { response_id: `resp_${stamp}`, item_id: 'fc_1', output_index: 0, name: 'diagnostic_ping', arguments: '{"value":"ok"}' })
-      sse(res, 'response.completed', { response: { id: `resp_${stamp}`, status: 'completed', output: [{ type: 'function_call', name: 'diagnostic_ping', arguments: '{"value":"ok"}' }] } })
-      res.end()
+    if (isHeaderProbe && (
+      req.headers.originator !== 'codex_cli_rs' ||
+      req.headers.version !== '0.144.2' ||
+      req.headers['user-agent'] !== 'codex_cli_rs/0.144.2'
+    )) {
+      res.statusCode = 403
+      res.end(JSON.stringify({ error: { message: 'missing codex request headers' } }))
       return
     }
     if (isVerified) verifiedHits += 1
     else unverifiedHits += 1
     sse(res, 'response.created', { response: { id: `resp_${stamp}`, status: 'in_progress', output: [] } })
-    sse(res, 'response.output_text.delta', { response_id: `resp_${stamp}`, item_id: 'msg_1', output_index: 0, content_index: 0, delta: 'CODEX_CAPABILITY_OK' })
-    sse(res, 'response.output_text.done', { response_id: `resp_${stamp}`, item_id: 'msg_1', output_index: 0, content_index: 0, text: 'CODEX_CAPABILITY_OK' })
-    sse(res, 'response.completed', { response: { id: `resp_${stamp}`, status: 'completed', output: [{ type: 'message', content: [{ type: 'output_text', text: 'CODEX_CAPABILITY_OK' }] }] } })
+    const output = isHeaderProbe ? 'CODEX_HEADER_OK' : 'CODEX_CAPABILITY_OK'
+    sse(res, 'response.output_text.delta', { response_id: `resp_${stamp}`, item_id: 'msg_1', output_index: 0, content_index: 0, delta: output })
+    sse(res, 'response.output_text.done', { response_id: `resp_${stamp}`, item_id: 'msg_1', output_index: 0, content_index: 0, text: output })
+    sse(res, 'response.completed', { response: { id: `resp_${stamp}`, status: 'completed', output: [{ type: 'message', content: [{ type: 'output_text', text: output }] }] } })
     res.end()
   })
   return new Promise((resolve, reject) => {

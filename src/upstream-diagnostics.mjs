@@ -219,16 +219,6 @@ export function describeRoutingSkip(provider, reason, model = '') {
     }
   }
 
-  if (reason === 'codex_unverified') {
-    return {
-      ...base,
-      code: 'provider_codex_unverified',
-      title: '线路未通过 Codex 验证',
-      message: `模型「${model || '(未指定)'}」尚未完成或未通过真实 Codex Responses 文本与工具调用测试，未参与本次请求。`,
-      suggestion: '在线路页运行“Codex 验证”；通过后才会参与启用了能力筛选的 Codex 路由。',
-    }
-  }
-
   return {
     ...base,
     code: 'provider_unavailable',

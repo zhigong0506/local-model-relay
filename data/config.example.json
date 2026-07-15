@@ -23,7 +23,6 @@
     "requestLogLimit": 1500,
     "outboundProxyMode": "direct",
     "outboundProxyUrl": "",
-    "capabilityRouting": false,
     "diagnosticsLlm": {
       "enabled": false,
       "baseUrl": "",

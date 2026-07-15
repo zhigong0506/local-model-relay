@@ -48,6 +48,8 @@ assert.doesNotMatch(main, /data-action="sync-usage"/)
 assert.doesNotMatch(main, /data-action="delete-provider"/)
 assert.doesNotMatch(main, /\/usage-sync/)
 assert.match(main, /runCodexCompatibilityTestForForm/)
+assert.match(html, /Codex 请求头验证/)
+assert.match(main, /正在携带 Codex 客户端请求头检查线路/)
 assert.match(main, /deleteProviderFromEditor/)
 assert.match(main, /openProviderGroupsDialog/)
 assert.match(main, /renderProviderGroupRows/)
@@ -74,6 +76,10 @@ assert.match(main, /actualProviderId !== provider\.id \|\| actualMode !== reques
 assert.match(main, /renderRuntimeNotice/)
 assert.match(main, /route-test-attempt/)
 assert.match(main, /sessionAffinity: formField\(form, 'sessionAffinity'\)\.checked/)
+assert.match(main, /function animateRowReorder/)
+assert.match(main, /function moveDraggedRow/)
+assert.match(main, /prefers-reduced-motion: reduce/)
+assert.match(main, /cubic-bezier\(0\.22, 1, 0\.36, 1\)/)
 assert.match(styles, /\.route-test-dialog/)
 assert.match(styles, /\.route-test-attempt/)
 assert.match(styles, /\.session-affinity-card/)
@@ -92,6 +98,9 @@ assert.match(styles, /\.error-detail-dialog/)
 assert.match(styles, /\.runtime-notice/)
 assert.match(styles, /\.ai-diagnostics-card/)
 assert.match(styles, /\.ai-diagnosis-panel/)
+assert.match(styles, /\.draggable-row\.drag-drop-before/)
+assert.match(styles, /\.target-row\.drag-drop-after/)
+assert.match(styles, /@media \(prefers-reduced-motion: reduce\)/)
 
 console.log(JSON.stringify({
   ok: true,
@@ -112,5 +121,7 @@ console.log(JSON.stringify({
   runtimeCompatibilityNotice: true,
   lightweightStatePolling: true,
   startProviderResponseValidation: true,
+  smoothDragReorder: true,
+  reducedMotionSupport: true,
   responsiveStyles: true,
 }, null, 2))

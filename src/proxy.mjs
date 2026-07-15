@@ -1,6 +1,7 @@
 import { resolveActiveCredential, resolveActiveKey } from './config-store.mjs'
 import { getCachedSystemProxy, resolveProviderOutboundProxy } from './outbound-proxy.mjs'
 import { upstreamErrorMessage } from './response-validation.mjs'
+import { buildReasoningFallback } from './reasoning-fallback.mjs'
 import { describeRoutingSkip, describeUpstreamFailure, redactSecretText } from './upstream-diagnostics.mjs'
 import {
   buildWireBody,
@@ -113,7 +114,6 @@ export async function handleProxyRequest(req, res, context) {
     virtualModel,
     stateStore,
     sessionContext.preferredProviderId,
-    isCodexCapabilityRequired(req.url, config.service),
   )
   const candidates = candidateContext.candidates
   const routingDiagnostics = [
@@ -163,14 +163,41 @@ export async function handleProxyRequest(req, res, context) {
     stateStore.markAttempt(candidate.provider.id)
 
     try {
-      const upstream = await callUpstream(req, body, candidate, config.service)
-      const upstreamResponse = upstream.response
-      const latencyMs = Date.now() - attempt.startedAt
+      let requestBody = body
+      let upstream = await callUpstream(req, requestBody, candidate, config.service)
+      let upstreamResponse = upstream.response
+      let latencyMs = Date.now() - attempt.startedAt
       attempt.status = upstreamResponse.status
       attempt.latencyMs = latencyMs
       let capturedUsage = null
       let streamInfo = null
       let responseId = ''
+
+      if (upstreamResponse.status >= 400) {
+        const firstFailureMessage = redactSecretText(
+          await readPreview(upstreamResponse.clone(), null, candidate.provider.timeoutMs),
+          resolveActiveKey(candidate.provider),
+        )
+        const fallback = buildReasoningFallback(body, {
+          status: upstreamResponse.status,
+          message: firstFailureMessage,
+        })
+        if (fallback) {
+          attempt.reasoningFallback = {
+            from: fallback.from,
+            to: fallback.to,
+            triggerStatus: upstreamResponse.status,
+            reason: fallback.reason,
+          }
+          upstream.abort()
+          requestBody = fallback.body
+          upstream = await callUpstream(req, requestBody, candidate, config.service)
+          upstreamResponse = upstream.response
+          latencyMs = Date.now() - attempt.startedAt
+          attempt.status = upstreamResponse.status
+          attempt.latencyMs = latencyMs
+        }
+      }
 
       if (shouldRetryStatus(upstreamResponse.status, config.service.retryStatusCodes)) {
         const message = redactSecretText(
@@ -195,7 +222,7 @@ export async function handleProxyRequest(req, res, context) {
       try {
         const piped = await pipeUpstreamResponse(upstreamResponse, res, candidate, attempts.length, upstream.abort, {
           collectUsage: config.service.collectUsage,
-          requestBody: body,
+          requestBody,
           wirePlan: upstream.wirePlan,
         })
         capturedUsage = piped.usage
@@ -436,7 +463,7 @@ export function buildCandidates(config, route, virtualModel, stateStore, preferr
   return buildCandidateContext(config, route, virtualModel, stateStore, preferredProviderId).candidates
 }
 
-function buildCandidateContext(config, route, virtualModel, stateStore, preferredProviderId = '', requireCodexCapability = false) {
+function buildCandidateContext(config, route, virtualModel, stateStore, preferredProviderId = '') {
   const providers = [...config.providers].sort((a, b) => a.priority - b.priority || a.name.localeCompare(b.name))
   const providersById = new Map(providers.map((provider) => [provider.id, provider]))
   const routing = currentRouting(stateStore)
@@ -449,7 +476,7 @@ function buildCandidateContext(config, route, virtualModel, stateStore, preferre
       const provider = providersById.get(target.providerId)
       if (!provider) continue
 
-      const reason = providerSkipReason(provider, stateStore, now, null, target.model, requireCodexCapability)
+      const reason = providerSkipReason(provider, stateStore, now, null)
       if (reason) {
         diagnostics.push(describeRoutingSkip(provider, reason, target.model))
         continue
@@ -460,7 +487,7 @@ function buildCandidateContext(config, route, virtualModel, stateStore, preferre
   }
 
   for (const provider of providers) {
-    const reason = providerSkipReason(provider, stateStore, now, virtualModel, virtualModel, requireCodexCapability)
+    const reason = providerSkipReason(provider, stateStore, now, virtualModel)
     if (reason) {
       diagnostics.push(describeRoutingSkip(provider, reason, virtualModel))
       continue
@@ -525,24 +552,12 @@ function describePinnedStartUnavailable(provider, route, model) {
   }
 }
 
-function providerSkipReason(provider, stateStore, now, virtualModel = null, routedModel = '', requireCodexCapability = false) {
+function providerSkipReason(provider, stateStore, now, virtualModel = null) {
   if (!provider.enabled) return 'provider_disabled'
   if (provider.authMode !== 'none' && !resolveActiveKey(provider)) return 'no_enabled_key'
   if (stateStore.isCooling(provider.id, now)) return 'cooldown'
   if (virtualModel !== null && provider.models.length > 0 && !provider.models.includes(virtualModel)) return 'unsupported_model'
-  if (requireCodexCapability && !hasVerifiedCodexCapability(provider, routedModel || virtualModel)) return 'codex_unverified'
   return ''
-}
-
-function hasVerifiedCodexCapability(provider, model) {
-  const result = provider?.capabilities?.codex?.models?.[model]
-  return result?.status === 'verified'
-}
-
-function isCodexCapabilityRequired(requestUrl, serviceConfig = {}) {
-  if (serviceConfig.capabilityRouting !== true) return false
-  const path = new URL(requestUrl, 'http://local').pathname.replace(/\/+$/, '')
-  return path === '/v1/responses' || path === '/responses'
 }
 
 function resolveSessionContext(req, body, stateStore, serviceConfig) {
@@ -1354,6 +1369,7 @@ function publicAttempt(attempt) {
     reconnectFailureCount: attempt.reconnectFailureCount || 0,
     reconnectFailureThreshold: attempt.reconnectFailureThreshold || 0,
     failoverArmed: Boolean(attempt.failoverArmed),
+    reasoningFallback: attempt.reasoningFallback || null,
   }
 }
 

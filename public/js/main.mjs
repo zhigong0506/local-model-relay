@@ -1,5 +1,7 @@
 const CLIENT_RUNTIME_PROTOCOL = 1
 const FULL_STATE_TABS = new Set(['dashboard', 'records', 'logs'])
+const DRAG_REORDER_DURATION_MS = 190
+const dragReorderAnimations = new WeakMap()
 
 const state = {
   config: null,
@@ -454,7 +456,6 @@ function renderSettings() {
   formField(form, 'reconnectFailureThreshold').value = service.reconnectFailureThreshold || 4
   formField(form, 'reconnectCooldownSeconds').value = service.reconnectCooldownSeconds || 600
   formField(form, 'sessionAffinity').checked = service.sessionAffinity !== false
-  formField(form, 'capabilityRouting').checked = service.capabilityRouting === true
   formField(form, 'sessionTtlSeconds').value = service.sessionTtlSeconds || 86400
   formField(form, 'sessionLimit').value = service.sessionLimit || 800
   const diagnosticsLlm = service.diagnosticsLlm || {}
@@ -1694,6 +1695,63 @@ function averageProviderLatency() {
   return Math.round(values.reduce((sum, value) => sum + value, 0) / values.length)
 }
 
+function prefersReducedMotion() {
+  return window.matchMedia?.('(prefers-reduced-motion: reduce)').matches === true
+}
+
+function clearDragDropIndicators(container) {
+  container.querySelectorAll('.drag-drop-before, .drag-drop-after').forEach((row) => {
+    row.classList.remove('drag-drop-before', 'drag-drop-after')
+  })
+}
+
+function markDragDropTarget(container, target, afterTarget) {
+  clearDragDropIndicators(container)
+  target.classList.add(afterTarget ? 'drag-drop-after' : 'drag-drop-before')
+}
+
+function animateRowReorder(rows, previousTops) {
+  if (prefersReducedMotion()) return
+
+  for (const row of rows) {
+    if (typeof row.animate !== 'function') continue
+    const previousTop = previousTops.get(row)
+    if (!Number.isFinite(previousTop)) continue
+    const deltaY = previousTop - row.getBoundingClientRect().top
+    if (Math.abs(deltaY) < 1) continue
+
+    dragReorderAnimations.get(row)?.cancel()
+    const animation = row.animate(
+      [
+        { transform: `translateY(${deltaY}px)` },
+        { transform: 'translateY(0)' },
+      ],
+      {
+        duration: DRAG_REORDER_DURATION_MS,
+        easing: 'cubic-bezier(0.22, 1, 0.36, 1)',
+      },
+    )
+    dragReorderAnimations.set(row, animation)
+    animation.onfinish = () => {
+      if (dragReorderAnimations.get(row) === animation) dragReorderAnimations.delete(row)
+    }
+    animation.oncancel = animation.onfinish
+  }
+}
+
+function moveDraggedRow(container, dragged, target, afterTarget) {
+  const alreadyPlaced = afterTarget
+    ? target.nextElementSibling === dragged
+    : target.previousElementSibling === dragged
+  if (alreadyPlaced) return false
+
+  const animatedRows = [...container.children].filter((row) => row !== dragged)
+  const previousTops = new Map(animatedRows.map((row) => [row, row.getBoundingClientRect().top]))
+  container.insertBefore(dragged, afterTarget ? target.nextSibling : target)
+  animateRowReorder(animatedRows, previousTops)
+  return true
+}
+
 function handleProviderDragStart(event) {
   if (!state.dragArmed) {
     event.preventDefault()
@@ -1705,6 +1763,7 @@ function handleProviderDragStart(event) {
   state.providerDragSaved = false
   row.classList.add('dragging')
   event.dataTransfer.effectAllowed = 'move'
+  event.dataTransfer.dropEffect = 'move'
   event.dataTransfer.setData('text/plain', row.dataset.providerId)
 }
 
@@ -1718,8 +1777,11 @@ function handleProviderDragOver(event) {
   const dragged = rows.querySelector(`tr[data-provider-id="${cssEscape(state.draggingProviderId)}"]`)
   if (!dragged) return
   const rect = target.getBoundingClientRect()
+  const midpoint = rect.top + rect.height / 2
+  if (Math.abs(event.clientY - midpoint) < 4) return
   const afterTarget = event.clientY > rect.top + rect.height / 2
-  rows.insertBefore(dragged, afterTarget ? target.nextSibling : target)
+  markDragDropTarget(rows, target, afterTarget)
+  moveDraggedRow(rows, dragged, target, afterTarget)
 }
 
 async function handleProviderDrop(event) {
@@ -1737,6 +1799,7 @@ function handleProviderDragEnd() {
   state.draggingProviderId = null
   state.providerDragSaved = false
   state.dragArmed = false
+  clearDragDropIndicators($('#providerRows'))
   $$('#providerRows .dragging').forEach((row) => row.classList.remove('dragging'))
   if (shouldSave) saveProviderOrderSafely(ids)
 }
@@ -1935,7 +1998,7 @@ async function runCodexCompatibilityTestForForm(form) {
       },
     })
     renderCodexTestResult(result)
-    toast(result.ok ? 'Codex 兼容性验证通过' : `Codex 验证失败：${result.message || `HTTP ${result.status || 0}`}`)
+    toast(result.ok ? 'Codex 请求头验证通过' : `Codex 请求头验证失败：${result.message || `HTTP ${result.status || 0}`}`)
     await refreshAll()
   } catch (error) {
     renderCodexTestResult({
@@ -1946,7 +2009,7 @@ async function runCodexCompatibilityTestForForm(form) {
     })
   } finally {
     button.disabled = !formField(form, 'model').value.trim()
-    button.textContent = '运行 Codex 验证'
+    button.textContent = '验证 Codex 请求头'
   }
 }
 
@@ -2138,13 +2201,13 @@ function renderCodexTestResult(result = null) {
   const node = $('#codexTestResult')
   if (!result) {
     node.className = 'codex-test-result empty'
-    node.textContent = '尚未运行 Codex 兼容性验证。'
+    node.textContent = '尚未运行 Codex 请求头验证。'
     return
   }
 
   node.className = `codex-test-result ${result.pending ? 'pending' : result.ok ? 'ok' : 'warn'}`
   if (result.pending) {
-    node.textContent = '正在检查文本流和函数调用流...'
+    node.textContent = '正在携带 Codex 客户端请求头检查线路...'
     return
   }
   if (result.skipped) {
@@ -2152,13 +2215,14 @@ function renderCodexTestResult(result = null) {
     return
   }
 
-  const textCheck = result.checks?.text || {}
-  const toolCheck = result.checks?.toolCall || {}
+  const headerCheck = result.checks?.requestHeaders || {}
+  const responseCheck = result.checks?.response || {}
   node.innerHTML = `
     <div><span class="label">状态</span><strong>${result.ok ? '通过' : '失败'} · HTTP ${result.status || 0}</strong></div>
     <div><span class="label">耗时</span><strong>${result.latencyMs || '-'} ms</strong></div>
-    <div><span class="label">文本流</span><strong>${escapeHtml(codexCheckLabel(textCheck))}</strong></div>
-    <div><span class="label">函数调用流</span><strong>${escapeHtml(codexCheckLabel(toolCheck))}</strong></div>
+    <div><span class="label">客户端</span><strong>${escapeHtml(headerCheck.originator || 'codex_cli_rs')}</strong></div>
+    <div><span class="label">版本</span><strong>${escapeHtml(headerCheck.version || '-')}</strong></div>
+    <div class="wide"><span class="label">响应</span><strong>${escapeHtml(codexCheckLabel(responseCheck))}</strong></div>
     <div class="wide"><span class="label">说明</span><strong>${escapeHtml(result.message || '-')}</strong></div>
   `
 }
@@ -2505,6 +2569,7 @@ function bindTargetDragSort() {
     state.draggingTargetRow = row
     row.classList.add('dragging')
     event.dataTransfer.effectAllowed = 'move'
+    event.dataTransfer.dropEffect = 'move'
     event.dataTransfer.setData('text/plain', 'target-row')
   }
   rows.ondragover = (event) => {
@@ -2513,8 +2578,11 @@ function bindTargetDragSort() {
     const target = event.target.closest('.target-row')
     if (!target || target === state.draggingTargetRow) return
     const rect = target.getBoundingClientRect()
+    const midpoint = rect.top + rect.height / 2
+    if (Math.abs(event.clientY - midpoint) < 4) return
     const afterTarget = event.clientY > rect.top + rect.height / 2
-    rows.insertBefore(state.draggingTargetRow, afterTarget ? target.nextSibling : target)
+    markDragDropTarget(rows, target, afterTarget)
+    moveDraggedRow(rows, state.draggingTargetRow, target, afterTarget)
   }
   rows.ondrop = (event) => {
     if (!state.draggingTargetRow) return
@@ -2531,6 +2599,7 @@ function bindTargetDragSort() {
 function clearTargetDrag() {
   state.draggingTargetRow = null
   state.dragArmed = false
+  clearDragDropIndicators($('#targetRows'))
   $$('#targetRows .dragging').forEach((row) => row.classList.remove('dragging'))
 }
 
@@ -2645,7 +2714,6 @@ async function saveSettings(event) {
       reconnectFailureThreshold: Number(formField(form, 'reconnectFailureThreshold').value),
       reconnectCooldownSeconds: Number(formField(form, 'reconnectCooldownSeconds').value),
       sessionAffinity: formField(form, 'sessionAffinity').checked,
-      capabilityRouting: formField(form, 'capabilityRouting').checked,
       sessionTtlSeconds: Number(formField(form, 'sessionTtlSeconds').value),
       sessionLimit: Number(formField(form, 'sessionLimit').value),
       diagnosticsLlm: {
@@ -2828,9 +2896,9 @@ function throwToast(message) {
 
 function codexCapabilityBadge(provider) {
   const results = Object.values(provider?.capabilities?.codex?.models || {})
-  if (results.some((item) => item?.status === 'failed')) return '<span class="pill warn" title="至少一个模型未通过真实 Codex 验证">Codex 失败</span>'
-  if (results.some((item) => item?.status === 'verified')) return '<span class="pill ok" title="至少一个模型已通过真实 Codex 验证">Codex 已验</span>'
-  return '<span class="pill off" title="尚未运行真实 Codex 验证">Codex 未验</span>'
+  if (results.some((item) => item?.status === 'failed')) return '<span class="pill warn" title="至少一个模型未通过 Codex 请求头验证">Codex 失败</span>'
+  if (results.some((item) => item?.status === 'verified')) return '<span class="pill ok" title="至少一个模型已通过 Codex 请求头验证">Codex 已验</span>'
+  return '<span class="pill off" title="尚未运行 Codex 请求头验证">Codex 未验</span>'
 }
 
 function providerBadge(provider, entry) {

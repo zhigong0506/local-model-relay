@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Added provider-isolated reasoning fallback: an upstream that explicitly
+  rejects `max` can retry once with `xhigh` without changing the original
+  request or downgrading later providers that support `max`.
+- Kept Codex request-header verification as a manual provider test only; it no
+  longer filters or reorders normal relay traffic.
+- Improved provider and model-route drag sorting with smoother motion and a
+  reduced-motion fallback.
+- Added regression coverage proving the request order remains
+  `provider A: max -> xhigh`, then `provider B: max`.
+
 ## 0.4.0 - 2026-07-14
 
 - Added provider-group management with OpenAI and DeepSeek defaults, group-aware
