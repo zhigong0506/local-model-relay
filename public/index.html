@@ -85,6 +85,7 @@
           <button class="tab" type="button" data-tab="records">记录</button>
           <button class="tab" type="button" data-tab="settings">设置</button>
           <button class="tab" type="button" data-tab="logs">日志</button>
+          <button class="tab" type="button" data-tab="radar">雷达</button>
         </aside>
 
         <section class="panel" id="dashboardPanel">
@@ -664,6 +665,43 @@
             </div>
           </div>
           <div id="logList" class="log-list"></div>
+        </section>
+        <section class="panel radar-panel" id="radarPanel">
+          <div class="panel-head radar-head">
+            <div>
+              <h2>Codex Reset Radar</h2>
+              <p id="radarStatus">打开此页时按需加载，离开后会自动释放。</p>
+            </div>
+            <div class="panel-tools">
+              <button id="reloadRadarBtn" class="icon-btn" type="button" title="重新加载雷达" aria-label="重新加载雷达">↻</button>
+              <button id="openRadarBtn" class="icon-btn" type="button" title="在浏览器新窗口打开" aria-label="在浏览器新窗口打开">↗</button>
+            </div>
+          </div>
+          <div class="radar-viewport">
+            <iframe
+              id="radarFrame"
+              title="Codex Reset Radar"
+              src="about:blank"
+              data-src="https://codex-reset-radar.pages.dev/"
+              loading="lazy"
+              referrerpolicy="strict-origin-when-cross-origin"
+              sandbox="allow-forms allow-popups allow-popups-to-escape-sandbox allow-same-origin allow-scripts"
+            ></iframe>
+          </div>
+          <div class="radar-attribution">
+            <p>
+              外部内容由
+              <a href="https://codex-reset-radar.pages.dev/" target="_blank" rel="noopener noreferrer">Codex Reset Radar</a>
+              提供。本项目仅提供非营利快捷查看，不存储或修改其内容，也不代表与站点存在官方合作。
+            </p>
+            <p>
+              推荐访问站主的
+              <a href="https://deng.codexradar.com/" target="_blank" rel="noopener noreferrer">登舱</a>；
+              如站点所有者希望移除此入口，可通过
+              <a href="https://github.com/zhigong0506/local-model-relay/issues" target="_blank" rel="noopener noreferrer">GitHub Issues</a>
+              联系。
+            </p>
+          </div>
         </section>
         <section class="panel" id="recordsPanel">
           <div class="panel-head">

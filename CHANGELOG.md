@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Added a lazy-loaded Radar tab embedding Codex Reset Radar, with clear source
+  attribution, a non-commercial notice, removal contact, and a link promoting
+  the site owner's Deng project.
 - Added provider-isolated reasoning fallback: an upstream that explicitly
   rejects `max` can retry once with `xhigh` without changing the original
   request or downgrading later providers that support `max`.

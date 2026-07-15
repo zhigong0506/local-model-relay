@@ -1,7 +1,9 @@
 const CLIENT_RUNTIME_PROTOCOL = 1
 const FULL_STATE_TABS = new Set(['dashboard', 'records', 'logs'])
 const DRAG_REORDER_DURATION_MS = 190
+const RADAR_RELEASE_DELAY_MS = 60000
 const dragReorderAnimations = new WeakMap()
+let radarReleaseTimer = null
 
 const state = {
   config: null,
@@ -67,6 +69,11 @@ function bindTabs() {
       $$('.panel').forEach((panel) => panel.classList.remove('active'))
       $(`#${button.dataset.tab}Panel`).classList.add('active')
       state.activeTab = button.dataset.tab
+      if (state.activeTab === 'radar') {
+        loadRadarFrame()
+      } else {
+        scheduleRadarRelease()
+      }
       if (FULL_STATE_TABS.has(state.activeTab)) {
         void refreshState({ forceFull: true })
         return
@@ -82,6 +89,8 @@ function bindTabs() {
 
 function bindActions() {
   $('#refreshBtn').addEventListener('click', refreshAll)
+  $('#reloadRadarBtn').addEventListener('click', reloadRadarFrame)
+  $('#openRadarBtn').addEventListener('click', openRadarWindow)
   $('#runtimeCheckBtn').addEventListener('click', refreshAll)
   $('#copyBaseUrlBtn').addEventListener('click', copyBaseUrl)
   $('#serviceToggle').addEventListener('change', toggleService)
@@ -162,6 +171,47 @@ function bindActions() {
   document.addEventListener('click', handleErrorDetailAction)
   document.addEventListener('click', closeModelPickersOnOutsideClick)
   document.addEventListener('keydown', closeModelPickersOnEscape)
+}
+
+function loadRadarFrame() {
+  clearTimeout(radarReleaseTimer)
+  radarReleaseTimer = null
+  const frame = $('#radarFrame')
+  if (!frame || frame.src !== 'about:blank') return
+  $('#radarStatus').textContent = '正在加载外部雷达页面…'
+  frame.onload = () => {
+    if (frame.src !== 'about:blank') $('#radarStatus').textContent = '雷达页面已加载'
+  }
+  frame.src = frame.dataset.src
+}
+
+function reloadRadarFrame() {
+  const frame = $('#radarFrame')
+  if (!frame) return
+  clearTimeout(radarReleaseTimer)
+  radarReleaseTimer = null
+  $('#radarStatus').textContent = '正在重新加载…'
+  frame.src = 'about:blank'
+  requestAnimationFrame(() => {
+    frame.src = frame.dataset.src
+  })
+}
+
+function openRadarWindow() {
+  window.open($('#radarFrame')?.dataset.src || 'https://codex-reset-radar.pages.dev/', '_blank', 'noopener,noreferrer')
+}
+
+function scheduleRadarRelease() {
+  clearTimeout(radarReleaseTimer)
+  const frame = $('#radarFrame')
+  if (!frame || frame.src === 'about:blank') return
+  radarReleaseTimer = setTimeout(() => {
+    if (state.activeTab === 'radar') return
+    frame.src = 'about:blank'
+    frame.onload = null
+    $('#radarStatus').textContent = '打开此页时按需加载，离开后会自动释放。'
+    radarReleaseTimer = null
+  }, RADAR_RELEASE_DELAY_MS)
 }
 
 function bindThemeControls() {

@@ -34,6 +34,19 @@ It is a personal desktop tool, not a multi-user gateway or billing platform.
 - Configuration import/export with masked-secret export by default
 - No runtime dependencies, build step, or external database
 
+### External radar notice
+
+The Radar tab lazily embeds
+[Codex Reset Radar](https://codex-reset-radar.pages.dev/) in an iframe. All
+external content, data, and branding belong to the original site. This project
+does not scrape, modify, or redistribute that data; the embed is provided only
+as a non-commercial local shortcut and does not imply an official partnership.
+
+You can also visit the site owner's project
+[Deng](https://deng.codexradar.com/). If the site owner would like the embed
+removed, please contact the maintainers through
+[GitHub Issues](https://github.com/zhigong0506/local-model-relay/issues).
+
 ## Requirements
 
 - Node.js 20 or newer
