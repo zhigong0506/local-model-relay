@@ -11,6 +11,7 @@ const requiredHtml = [
   'id="modelShareLegend"',
   'id="usageModelShareLegend"',
   'id="usageProviderShareLegend"',
+  'class="chart-card model-share-card"',
 ]
 const missingHtml = requiredHtml.filter((snippet) => !html.includes(snippet))
 if (missingHtml.length) throw new Error(`Theme/chart markup is missing: ${missingHtml.join(', ')}`)
@@ -43,6 +44,18 @@ const requiredCss = [
 ]
 const missingCss = requiredCss.filter((snippet) => !css.includes(snippet))
 if (missingCss.length) throw new Error(`Theme/chart styles are missing: ${missingCss.join(', ')}`)
+if (!/\.chart-grid\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1\.2fr\) minmax\(330px, 0\.8fr\)/s.test(css)) {
+  throw new Error('Dashboard must keep its two-column chart layout with a slightly wider visualization column')
+}
+if (!/\.model-share-card \.share-chart-layout\s*\{[^}]*grid-template-columns:\s*minmax\(300px, 0\.95fr\) minmax\(0, 1\.05fr\)/s.test(css)) {
+  throw new Error('Model share card must balance a large chart with a flexible legend column')
+}
+if (!/\.model-share-card \.share-chart-legend\s*\{[^}]*align-content:\s*space-evenly/s.test(css)) {
+  throw new Error('Model share legend must use the available card height')
+}
+if (!/@media \(min-width: 761px\) and \(max-width: 1200px\)[\s\S]*?\.model-share-card \.share-chart-layout\s*\{[^}]*grid-template-columns:\s*minmax\(230px, 0\.8fr\) minmax\(0, 1\.2fr\)/s.test(css)) {
+  throw new Error('Model share card must shrink without overflowing at intermediate desktop widths')
+}
 
 console.log(JSON.stringify({
   ok: true,
@@ -52,4 +65,7 @@ console.log(JSON.stringify({
   readableDarkProxyOptions: true,
   compactShareCharts: 3,
   externalLegends: 3,
+  restoredDashboardColumns: true,
+  balancedModelShareCard: true,
+  intermediateWidthGuard: true,
 }, null, 2))

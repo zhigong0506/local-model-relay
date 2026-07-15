@@ -10,7 +10,7 @@ import {
 import { configPath } from './paths.mjs'
 
 export const DEFAULT_CONFIG = {
-  version: 3,
+  version: 4,
   service: {
     enabled: true,
     listenHost: '127.0.0.1',
@@ -65,6 +65,9 @@ export const DEFAULT_CONFIG = {
 
 const AUTH_MODES = new Set(['authorization', 'x-api-key', 'both', 'none'])
 const WIRE_APIS = new Set(['chat', 'responses', 'auto'])
+const PROVIDER_TYPES = new Set(['openai_compatible', 'codex_oauth'])
+const CREDENTIAL_KINDS = new Set(['api_key', 'oauth', 'access_token'])
+const CODEX_OAUTH_BASE_URL = 'https://chatgpt.com/backend-api/codex'
 
 export class ConfigStore {
   constructor(filePath = configPath) {
@@ -116,13 +119,16 @@ export class ConfigStore {
         credentials: provider.credentials.map((credential) => ({
           ...credential,
           apiKey: maskSecret(credential.apiKey),
+          accessToken: maskSecret(credential.accessToken),
+          refreshToken: maskSecret(credential.refreshToken),
+          idToken: maskSecret(credential.idToken),
         })),
       }))
     }
 
     return {
       app: 'local-model-relay',
-      version: 3,
+      version: 4,
       exportedAt: new Date().toISOString(),
       includesSecrets: Boolean(includeSecrets),
       config,
@@ -169,13 +175,114 @@ export class ConfigStore {
 
     const credential = provider.credentials.find((item) => item.id === credentialId)
     if (!credential) throw new HttpError(404, 'credential_not_found', 'Credential not found.')
-    if (!credential.enabled) throw new HttpError(400, 'credential_disabled', 'Credential is disabled.')
+    if (!isCredentialUsable(credential)) throw new HttpError(400, 'credential_disabled', 'Credential is disabled or needs authentication.')
+
+    if (provider.activeCredentialId === credential.id) return publicProvider(provider)
 
     provider.activeCredentialId = credential.id
     provider.updatedAt = new Date().toISOString()
     this.touch()
     this.persist()
     return publicProvider(provider)
+  }
+
+  getCredential(providerId, credentialId) {
+    const provider = this.config.providers.find((item) => item.id === providerId)
+    const credential = provider?.credentials.find((item) => item.id === credentialId)
+    return credential ? structuredClone(credential) : null
+  }
+
+  updateCredentialAuth(providerId, credentialId, patch = {}) {
+    const provider = this.config.providers.find((item) => item.id === providerId)
+    if (!provider) throw new HttpError(404, 'provider_not_found', 'Provider not found.')
+    const index = provider.credentials.findIndex((item) => item.id === credentialId)
+    if (index < 0) throw new HttpError(404, 'credential_not_found', 'Credential not found.')
+
+    const existing = provider.credentials[index]
+    provider.credentials[index] = normalizeCredential({
+      ...existing,
+      ...pickCredentialAuthPatch(patch),
+      id: existing.id,
+    })
+    provider.activeCredentialId = selectActiveCredentialId(provider.credentials, provider.activeCredentialId)
+    provider.apiKey = activeApiKey(provider)
+    provider.updatedAt = new Date().toISOString()
+    this.touch()
+    this.persist()
+    return structuredClone(provider.credentials[index])
+  }
+
+  upsertCodexOAuthCredential(providerId = '', input = {}) {
+    let provider = this.config.providers.find((item) => item.id === providerId)
+    if (providerId && !provider) throw new HttpError(404, 'provider_not_found', 'Provider not found.')
+    if (provider && provider.providerType !== 'codex_oauth') {
+      throw new HttpError(409, 'invalid_oauth_provider', 'Codex OAuth accounts can only be added to a Codex OAuth provider.')
+    }
+
+    if (!provider) provider = this.config.providers.find((item) => item.providerType === 'codex_oauth')
+    if (!provider) {
+      provider = normalizeProvider({
+        id: randomUUID(),
+        groupId: resolveProviderGroupId('openai', this.config.providerGroups),
+        providerType: 'codex_oauth',
+        name: 'Codex OAuth',
+        baseUrl: CODEX_OAUTH_BASE_URL,
+        credentials: [],
+        authMode: 'authorization',
+        wireApi: 'responses',
+        outboundProxyMode: 'inherit',
+        priority: nextPriority(this.config.providers),
+        timeoutMs: this.config.service.requestTimeoutMs,
+        cooldownSeconds: this.config.service.defaultCooldownSeconds,
+        models: [],
+        tags: ['Codex', 'OAuth'],
+        notes: '通过本机浏览器 OAuth 登录的 Codex 账号。',
+        enabled: true,
+      }, { allowEmptyCredentials: true })
+      this.config.providers.push(provider)
+    }
+
+    const incoming = normalizeCredential({
+      ...input,
+      id: input.id || randomUUID(),
+      kind: input.refreshToken ? 'oauth' : input.kind || 'access_token',
+      providerType: 'codex',
+      label: input.label || input.email || 'Codex OAuth',
+      enabled: input.enabled !== false,
+    })
+    if (!incoming.accessToken) throw new HttpError(400, 'invalid_oauth_credential', 'Codex OAuth access token is required.')
+
+    const index = findMatchingCodexCredential(provider.credentials, incoming)
+    let credential
+    if (index >= 0) {
+      const existing = provider.credentials[index]
+      credential = normalizeCredential({
+        ...existing,
+        ...incoming,
+        id: existing.id,
+        refreshToken: incoming.refreshToken || existing.refreshToken,
+        idToken: incoming.idToken || existing.idToken,
+      })
+      provider.credentials[index] = credential
+    } else {
+      credential = incoming
+      provider.credentials.push(credential)
+    }
+
+    provider.activeCredentialId = credential.id
+    provider.providerType = 'codex_oauth'
+    provider.baseUrl = CODEX_OAUTH_BASE_URL
+    provider.authMode = 'authorization'
+    provider.wireApi = 'responses'
+    provider.apiKey = ''
+    provider.updatedAt = new Date().toISOString()
+    syncRoutesWithProviders(this.config)
+    this.touch()
+    this.persist()
+    return {
+      provider: publicProvider(provider),
+      credential: publicCredential(credential),
+    }
   }
 
   createProviderGroup(input) {
@@ -415,22 +522,37 @@ export function publicProvider(provider) {
   const clone = { ...provider }
   delete clone.apiKey
   clone.outboundProxyUrl = maskProxyUrl(provider.outboundProxyUrl)
-  clone.credentials = provider.credentials.map((credential) => ({
-    id: credential.id,
-    label: credential.label,
-    enabled: credential.enabled,
-    note: credential.note,
-    rate: credential.rate,
-    upstreamGroup: credential.upstreamGroup,
-    upstreamStatus: credential.upstreamStatus,
-    apiKeySet: Boolean(credential.apiKey),
-    apiKeyMasked: maskSecret(credential.apiKey),
-  }))
+  clone.credentials = provider.credentials.map(publicCredential)
   const active = resolveActiveCredential(provider)
   clone.activeCredentialLabel = active?.label || ''
   clone.apiKeySet = Boolean(resolveActiveKey(provider))
   clone.apiKeyMasked = maskSecret(resolveActiveKey(provider))
   return clone
+}
+
+function publicCredential(credential) {
+  return {
+    id: credential.id,
+    label: credential.label,
+    kind: credential.kind,
+    providerType: credential.providerType,
+    enabled: credential.enabled,
+    note: credential.note,
+    rate: credential.rate,
+    upstreamGroup: credential.upstreamGroup,
+    upstreamStatus: credential.upstreamStatus,
+    email: credential.email,
+    accountId: credential.accountId,
+    planType: credential.planType,
+    expiresAt: credential.expiresAt,
+    lastRefreshAt: credential.lastRefreshAt,
+    authStatus: credential.authStatus,
+    lastAuthError: credential.lastAuthError,
+    apiKeySet: Boolean(credential.apiKey),
+    apiKeyMasked: maskSecret(credential.apiKey),
+    accessTokenSet: Boolean(credential.accessToken),
+    refreshTokenSet: Boolean(credential.refreshToken),
+  }
 }
 
 export function publicRoute(route, providers) {
@@ -471,23 +593,63 @@ function preserveProviderSecrets(input, existing) {
     next.credentials = next.credentials.map((credential) => {
       if (!isRecord(credential)) return credential
       const old = existingCredentials.get(credential.id)
-      if (isMaskedOrEmpty(credential.apiKey)) {
-        return { ...credential, apiKey: old?.apiKey || '' }
-      }
-      return credential
+      return preserveCredentialSecrets(credential, old)
     })
   }
 
   return next
 }
 
+function preserveCredentialSecrets(input, existing) {
+  if (!existing) return input
+  const next = { ...input }
+  for (const field of ['apiKey', 'accessToken', 'refreshToken', 'idToken']) {
+    if (isMaskedOrEmpty(next[field])) next[field] = existing[field] || ''
+  }
+  return next
+}
+
+function pickCredentialAuthPatch(input) {
+  const fields = [
+    'kind',
+    'providerType',
+    'accessToken',
+    'refreshToken',
+    'idToken',
+    'expiresAt',
+    'lastRefreshAt',
+    'email',
+    'accountId',
+    'planType',
+    'authStatus',
+    'lastAuthError',
+  ]
+  const patch = {}
+  for (const field of fields) {
+    if (Object.hasOwn(input, field)) patch[field] = input[field]
+  }
+  return patch
+}
+
+function findMatchingCodexCredential(credentials, incoming) {
+  if (incoming.accountId) {
+    return credentials.findIndex((item) => item.providerType === 'codex' && item.accountId === incoming.accountId)
+  }
+  if (incoming.email) {
+    return credentials.findIndex((item) => (
+      item.providerType === 'codex' &&
+      !item.accountId &&
+      item.email &&
+      item.email.toLocaleLowerCase() === incoming.email.toLocaleLowerCase()
+    ))
+  }
+  return -1
+}
+
 export function resolveActiveKey(provider) {
   const credentials = Array.isArray(provider.credentials) ? provider.credentials : []
-  const active =
-    credentials.find((credential) => credential.id === provider.activeCredentialId && credential.enabled) ||
-    credentials.find((credential) => credential.enabled) ||
-    null
-  if (active) return active.apiKey || ''
+  const active = resolveActiveCredential(provider)
+  if (active) return credentialSecret(active)
   // A legacy provider may have no credentials array at all. Once credentials
   // exist, all-disabled means intentionally unavailable and must not fall back
   // to a disabled credential or a stale provider.apiKey value.
@@ -497,10 +659,29 @@ export function resolveActiveKey(provider) {
 export function resolveActiveCredential(provider) {
   const credentials = Array.isArray(provider.credentials) ? provider.credentials : []
   return (
-    credentials.find((credential) => credential.id === provider.activeCredentialId && credential.enabled) ||
-    credentials.find((credential) => credential.enabled) ||
+    credentials.find((credential) => credential.id === provider.activeCredentialId && isCredentialUsable(credential)) ||
+    credentials.find((credential) => isCredentialUsable(credential)) ||
     null
   )
+}
+
+export function credentialSecret(credential) {
+  if (!credential) return ''
+  return credential.kind === 'api_key' ? credential.apiKey || '' : credential.accessToken || ''
+}
+
+export function isCredentialUsable(credential) {
+  if (!credential || credential.enabled === false || credential.authStatus === 'reauth_required') return false
+  return Boolean(credentialSecret(credential))
+}
+
+function activeApiKey(provider) {
+  const credentials = Array.isArray(provider.credentials) ? provider.credentials : []
+  const active =
+    credentials.find((credential) => credential.id === provider.activeCredentialId && credential.kind === 'api_key') ||
+    credentials.find((credential) => credential.kind === 'api_key' && credential.enabled) ||
+    null
+  return active?.apiKey || ''
 }
 
 function normalizeConfig(value) {
@@ -515,7 +696,7 @@ function normalizeConfig(value) {
     }))
     : []
   const config = {
-    version: 3,
+    version: 4,
     service: normalizeService({ ...DEFAULT_CONFIG.service, ...value.service }),
     providerGroups,
     providers,
@@ -646,11 +827,12 @@ function assertProviderPatch(patch) {
   }
 }
 
-function normalizeProvider(input) {
+function normalizeProvider(input, options = {}) {
   if (!isRecord(input)) throw new Error('provider must be an object')
 
   const name = toText(input.name, '')
   const baseUrl = toText(input.baseUrl, '')
+  const providerType = normalizeProviderType(input.providerType)
   if (!name) throw new HttpError(400, 'invalid_provider', 'Provider name is required.')
   if (!isHttpUrl(baseUrl)) throw new HttpError(400, 'invalid_provider', 'Provider base URL must start with http:// or https://.')
 
@@ -663,7 +845,17 @@ function normalizeProvider(input) {
     throw new HttpError(400, 'invalid_provider', 'Invalid wire API.')
   }
 
-  const credentials = normalizeCredentials(input)
+  const credentials = normalizeCredentials(input, options)
+  if (providerType === 'codex_oauth') {
+    if (!isAllowedCodexOAuthBaseUrl(baseUrl)) {
+      throw new HttpError(400, 'invalid_provider', 'Codex OAuth credentials can only use the official Codex endpoint.')
+    }
+    if (credentials.some((credential) => credential.kind === 'api_key')) {
+      throw new HttpError(400, 'invalid_provider', 'Codex OAuth providers only accept OAuth or access-token credentials.')
+    }
+  } else if (credentials.some((credential) => credential.kind !== 'api_key')) {
+    throw new HttpError(400, 'invalid_provider', 'OAuth credentials cannot be attached to an OpenAI-compatible provider.')
+  }
   const activeCredentialId = selectActiveCredentialId(credentials, toText(input.activeCredentialId, ''))
   const outboundProxyMode = normalizeProviderOutboundProxyMode(input.outboundProxyMode)
   const outboundProxyUrl = normalizeProxyUrl(input.outboundProxyUrl)
@@ -671,13 +863,14 @@ function normalizeProvider(input) {
   return {
     id: toText(input.id, randomUUID()),
     groupId: toText(input.groupId, 'openai'),
+    providerType,
     name,
     baseUrl: trimTrailingSlash(baseUrl),
-    apiKey: resolveActiveKey({ credentials, activeCredentialId }),
+    apiKey: activeApiKey({ credentials, activeCredentialId }),
     credentials,
     activeCredentialId,
-    authMode,
-    wireApi,
+    authMode: providerType === 'codex_oauth' ? 'authorization' : authMode,
+    wireApi: providerType === 'codex_oauth' ? 'responses' : wireApi,
     outboundProxyMode: outboundProxyMode === 'custom' && !outboundProxyUrl ? 'inherit' : outboundProxyMode,
     outboundProxyUrl,
     capabilities: normalizeCapabilities(input.capabilities),
@@ -690,6 +883,20 @@ function normalizeProvider(input) {
     notes: toText(input.notes, ''),
     createdAt: typeof input.createdAt === 'string' ? input.createdAt : new Date().toISOString(),
     updatedAt: new Date().toISOString(),
+  }
+}
+
+function isAllowedCodexOAuthBaseUrl(value) {
+  try {
+    const parsed = new URL(value)
+    if (parsed.username || parsed.password || parsed.search || parsed.hash) return false
+    const path = parsed.pathname.replace(/\/+$/, '')
+    if (parsed.protocol === 'https:' && parsed.hostname === 'chatgpt.com' && path === '/backend-api/codex') {
+      return true
+    }
+    return ['127.0.0.1', 'localhost', '[::1]'].includes(parsed.hostname)
+  } catch {
+    return false
   }
 }
 
@@ -751,7 +958,7 @@ function nextProviderGroupPriority(groups) {
   return Math.max(...groups.map((group) => Number(group.priority) || 0)) + 10
 }
 
-function normalizeCredentials(input) {
+function normalizeCredentials(input, options = {}) {
   let credentials = Array.isArray(input.credentials)
     ? input.credentials.map(normalizeCredential).filter(Boolean)
     : []
@@ -766,7 +973,7 @@ function normalizeCredentials(input) {
     })]
   }
 
-  if (credentials.length === 0) {
+  if (credentials.length === 0 && !options.allowEmptyCredentials) {
     credentials = [normalizeCredential({
       id: randomUUID(),
       label: '默认',
@@ -781,10 +988,24 @@ function normalizeCredentials(input) {
 
 function normalizeCredential(input) {
   if (!isRecord(input)) return null
+  const requestedKind = toText(input.kind, 'api_key')
+  const kind = CREDENTIAL_KINDS.has(requestedKind) ? requestedKind : 'api_key'
   return {
     id: toText(input.id, randomUUID()),
     label: toText(input.label, '默认'),
-    apiKey: typeof input.apiKey === 'string' ? input.apiKey.trim() : '',
+    kind,
+    providerType: kind === 'api_key' ? '' : toText(input.providerType, 'codex'),
+    apiKey: kind === 'api_key' && typeof input.apiKey === 'string' ? input.apiKey.trim() : '',
+    accessToken: kind !== 'api_key' && typeof input.accessToken === 'string' ? input.accessToken.trim() : '',
+    refreshToken: kind === 'oauth' && typeof input.refreshToken === 'string' ? input.refreshToken.trim() : '',
+    idToken: kind !== 'api_key' && typeof input.idToken === 'string' ? input.idToken.trim() : '',
+    expiresAt: normalizeIsoDate(input.expiresAt),
+    lastRefreshAt: normalizeIsoDate(input.lastRefreshAt),
+    email: toText(input.email, ''),
+    accountId: toText(input.accountId, ''),
+    planType: toText(input.planType, ''),
+    authStatus: normalizeAuthStatus(input.authStatus),
+    lastAuthError: toText(input.lastAuthError, '').slice(0, 500),
     enabled: input.enabled !== false,
     note: toText(input.note, ''),
     rate: toPositiveNumber(input.rate, 1),
@@ -794,9 +1015,9 @@ function normalizeCredential(input) {
 }
 
 function selectActiveCredentialId(credentials, preferredId = '') {
-  const preferred = credentials.find((credential) => credential.id === preferredId && credential.enabled)
+  const preferred = credentials.find((credential) => credential.id === preferredId && isCredentialUsable(credential))
   if (preferred) return preferred.id
-  const enabled = credentials.find((credential) => credential.enabled)
+  const enabled = credentials.find((credential) => isCredentialUsable(credential))
   return enabled?.id || ''
 }
 
@@ -939,6 +1160,22 @@ function normalizeCapabilities(value) {
 function normalizeStringList(value) {
   const raw = Array.isArray(value) ? value : String(value || '').split(/[\n,]/)
   return [...new Set(raw.map((item) => String(item).trim()).filter(Boolean))]
+}
+
+function normalizeProviderType(value) {
+  const type = toText(value, 'openai_compatible')
+  return PROVIDER_TYPES.has(type) ? type : 'openai_compatible'
+}
+
+function normalizeAuthStatus(value) {
+  const status = toText(value, 'active')
+  return ['active', 'reauth_required', 'error'].includes(status) ? status : 'active'
+}
+
+function normalizeIsoDate(value) {
+  if (typeof value !== 'string' || !value.trim()) return ''
+  const timestamp = Date.parse(value)
+  return Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : ''
 }
 
 function nextPriority(providers) {

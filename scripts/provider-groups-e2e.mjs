@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 const relay = process.env.RELAY_URL || 'http://127.0.0.1:25818'
 
 const initial = await api('/api/config')
-assert.equal(initial.version, 3)
+assert.equal(initial.version, 4)
 assert.deepEqual(initial.providerGroups.map((group) => group.id), ['openai', 'deepseek'])
 
 const createdGroup = await api('/api/provider-groups', {

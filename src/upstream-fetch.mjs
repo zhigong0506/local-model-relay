@@ -77,72 +77,70 @@ function httpProxyFetch(target, proxyUrl, init = {}) {
 }
 
 function httpsProxyFetch(target, proxyUrl, init = {}) {
-  const client = proxyUrl.protocol === 'https:' ? https : http
-  const targetPort = target.port || '443'
+  return new Promise((resolve, reject) => {
+    const headers = toNodeHeaders(init.headers)
+    if (!hasHeader(headers, 'accept-encoding')) headers['accept-encoding'] = 'identity'
+
+    const agent = createHttpsProxyAgent(proxyUrl, init.signal)
+    const request = https.request(target, {
+      method: init.method || 'GET',
+      headers,
+      agent,
+      signal: init.signal,
+    }, (message) => resolveResponse(message, resolve))
+
+    request.once('error', reject)
+    request.once('close', () => agent.destroy())
+    endRequest(request, init.body)
+  })
+}
+
+function createHttpsProxyAgent(proxyUrl, signal) {
+  const proxyClient = proxyUrl.protocol === 'https:' ? https : http
   const proxyHeaders = proxyAuthorizationHeaders(proxyUrl)
 
-  return new Promise((resolve, reject) => {
-    let settled = false
-    const resolveOnce = (value) => {
-      if (settled) return
-      settled = true
-      resolve(value)
-    }
-    const rejectOnce = (error) => {
-      if (settled) return
-      settled = true
-      reject(error)
-    }
-    const connect = client.request({
-      protocol: proxyUrl.protocol,
-      hostname: proxyUrl.hostname,
-      port: proxyUrl.port || defaultProxyPort(proxyUrl),
-      method: 'CONNECT',
-      path: `${target.hostname}:${targetPort}`,
-      headers: {
-        ...proxyHeaders,
-        host: `${target.hostname}:${targetPort}`,
-      },
-      signal: init.signal,
-    })
-
-    connect.once('connect', (response, socket) => {
-      if ((response.statusCode || 0) < 200 || (response.statusCode || 0) >= 300) {
-        protectSocketErrors(socket)
-        socket.destroy()
-        rejectOnce(new Error(`Proxy CONNECT failed with HTTP ${response.statusCode || 0}`))
-        return
-      }
-
-      const secureSocket = tls.connect({
-        socket,
-        servername: target.hostname,
-      })
-      secureSocket.on('error', rejectOnce)
-      secureSocket.once('close', () => secureSocket.off('error', rejectOnce))
-
-      const headers = toNodeHeaders(init.headers)
-      if (!hasHeader(headers, 'accept-encoding')) {
-        headers['accept-encoding'] = 'identity'
-      }
-
-      const request = https.request(target, {
-        method: init.method || 'GET',
-        headers,
-        createConnection: () => secureSocket,
-        agent: false,
-        signal: init.signal,
-      }, (message) => {
-        resolveResponse(message, resolveOnce)
+  return new class extends https.Agent {
+    createConnection(options, callback) {
+      const targetHost = options.host || options.hostname
+      const targetPort = options.port || 443
+      const connect = proxyClient.request({
+        protocol: proxyUrl.protocol,
+        hostname: proxyUrl.hostname,
+        port: proxyUrl.port || defaultProxyPort(proxyUrl),
+        method: 'CONNECT',
+        path: `${targetHost}:${targetPort}`,
+        headers: { ...proxyHeaders, host: `${targetHost}:${targetPort}` },
+        signal,
       })
 
-      request.on('error', rejectOnce)
-      endRequest(request, init.body)
-    })
+      let settled = false
+      const finish = (error, socket) => {
+        if (settled) return
+        settled = true
+        callback(error, socket)
+      }
 
-    connect.on('error', rejectOnce)
-    connect.end()
-  })
+      connect.once('connect', (response, socket) => {
+        const status = response.statusCode || 0
+        if (status < 200 || status >= 300) {
+          protectSocketErrors(socket)
+          socket.destroy()
+          finish(new Error(`Proxy CONNECT failed with HTTP ${status}`))
+          return
+        }
+
+        const secureSocket = tls.connect({
+          socket,
+          servername: options.servername || targetHost,
+          ALPNProtocols: ['http/1.1'],
+        })
+        secureSocket.once('secureConnect', () => finish(null, secureSocket))
+        secureSocket.once('error', (error) => finish(error))
+      })
+      connect.once('error', (error) => finish(error))
+      connect.end()
+    }
+  }()
 }
 
 function toNodeHeaders(headersInit = {}) {

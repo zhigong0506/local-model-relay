@@ -4,6 +4,7 @@ const DRAG_REORDER_DURATION_MS = 190
 const RADAR_RELEASE_DELAY_MS = 60000
 const dragReorderAnimations = new WeakMap()
 let radarReleaseTimer = null
+let codexOAuthPollTimer = null
 
 const state = {
   config: null,
@@ -34,6 +35,8 @@ const state = {
   selectedErrorLog: null,
   aiDiagnosis: null,
   clearDiagnosticsLlmKey: false,
+  codexOAuthState: '',
+  codexOAuthAuthUrl: '',
   recordsFilter: {
     search: '',
     status: 'all',
@@ -95,6 +98,11 @@ function bindActions() {
   $('#copyBaseUrlBtn').addEventListener('click', copyBaseUrl)
   $('#serviceToggle').addEventListener('change', toggleService)
   $('#newProviderBtn').addEventListener('click', () => openProviderDialog(null, preferredNewProviderGroupId()))
+  $('#codexOAuthBtn').addEventListener('click', openCodexOAuthDialog)
+  $('#startCodexOAuthBtn').addEventListener('click', startCodexOAuth)
+  $('#completeCodexOAuthBtn').addEventListener('click', completeCodexOAuth)
+  $('#importCodexOAuthBtn').addEventListener('click', importCodexOAuth)
+  $('#cancelCodexOAuthBtn').addEventListener('click', cancelCodexOAuth)
   $('#quickProviderBtn').addEventListener('click', () => openProviderDialog(null, preferredNewProviderGroupId()))
   $('#manageProviderGroupsBtn').addEventListener('click', openProviderGroupsDialog)
   $('#providerGroupTabs').addEventListener('click', handleProviderGroupTabClick)
@@ -2432,6 +2440,165 @@ async function handleRouteAction(event) {
   }
 }
 
+function openCodexOAuthDialog() {
+  const select = $('#codexOAuthProviderSelect')
+  const providers = (state.config?.providers || []).filter((provider) => provider.providerType === 'codex_oauth')
+  select.innerHTML = [
+    '<option value="">自动创建或使用 Codex OAuth 线路</option>',
+    ...providers.map((provider) => `<option value="${escapeHtml(provider.id)}">${escapeHtml(provider.name)}</option>`),
+  ].join('')
+  state.codexOAuthState = ''
+  state.codexOAuthAuthUrl = ''
+  $('#codexOAuthCallbackUrl').value = ''
+  $('#codexOAuthManual').hidden = true
+  setCodexOAuthStatus('尚未开始登录。', 'idle')
+  $('#codexOAuthDialog').showModal()
+}
+
+async function startCodexOAuth() {
+  const button = $('#startCodexOAuthBtn')
+  const loginWindow = window.open('about:blank', 'localModelRelayCodexOAuth', 'popup,width=720,height=760')
+  button.disabled = true
+  setCodexOAuthStatus('正在创建本机 OAuth 会话……', 'working')
+  try {
+    const result = await api('/api/oauth/codex/start', {
+      method: 'POST',
+      body: { providerId: $('#codexOAuthProviderSelect').value },
+    })
+    state.codexOAuthState = result.state
+    $('#codexOAuthManual').hidden = result.callbackMode !== 'manual'
+    if (loginWindow) loginWindow.location.href = result.authUrl
+    setCodexOAuthStatus(
+      result.callbackMode === 'automatic'
+        ? '已打开 OpenAI 登录页面，正在等待授权回调。'
+        : '回调端口 1455 正被占用。登录后请把浏览器地址栏中的回调地址粘贴到下方。',
+      result.callbackMode === 'automatic' ? 'working' : 'warn',
+    )
+    state.codexOAuthAuthUrl = loginWindow ? '' : result.authUrl
+    if (!loginWindow) showCodexOAuthLink(result.authUrl)
+    pollCodexOAuth(result.state)
+  } catch (error) {
+    if (loginWindow && !loginWindow.closed) loginWindow.close()
+    setCodexOAuthStatus(`启动失败：${error.message}`, 'error')
+  } finally {
+    button.disabled = false
+  }
+}
+
+async function completeCodexOAuth() {
+  const callbackUrl = $('#codexOAuthCallbackUrl').value.trim()
+  if (!callbackUrl) {
+    toast('请粘贴完整回调地址')
+    return
+  }
+  setCodexOAuthStatus('正在交换 OAuth Token……', 'working')
+  try {
+    const result = await api('/api/oauth/codex/complete', {
+      method: 'POST',
+      body: { state: state.codexOAuthState, callbackUrl },
+    })
+    await handleCodexOAuthStatus(result)
+  } catch (error) {
+    setCodexOAuthStatus(`登录失败：${error.message}`, 'error')
+  }
+}
+
+async function importCodexOAuth() {
+  const button = $('#importCodexOAuthBtn')
+  let parsed
+  try {
+    parsed = JSON.parse($('#codexOAuthImportJson').value)
+  } catch {
+    toast('OAuth JSON 格式无效')
+    return
+  }
+  const accounts = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.accounts) ? parsed.accounts : [parsed]
+  button.disabled = true
+  setCodexOAuthStatus('正在校验并导入 OAuth 账号……', 'working')
+  try {
+    const result = await api('/api/oauth/codex/import', {
+      method: 'POST',
+      body: { providerId: $('#codexOAuthProviderSelect').value, accounts },
+    })
+    $('#codexOAuthImportJson').value = ''
+    setCodexOAuthStatus(`已导入 ${result.imported} 个账号。`, 'success')
+    toast('Codex OAuth 账号已导入')
+    await refreshAll()
+  } catch (error) {
+    setCodexOAuthStatus(`导入失败：${error.message}`, 'error')
+  } finally {
+    button.disabled = false
+  }
+}
+
+async function cancelCodexOAuth() {
+  if (!state.codexOAuthState) {
+    setCodexOAuthStatus('当前没有等待中的登录。', 'idle')
+    return
+  }
+  clearTimeout(codexOAuthPollTimer)
+  codexOAuthPollTimer = null
+  await api('/api/oauth/codex/cancel', {
+    method: 'POST',
+    body: { state: state.codexOAuthState },
+  })
+  state.codexOAuthState = ''
+  state.codexOAuthAuthUrl = ''
+  setCodexOAuthStatus('当前登录已取消。', 'idle')
+}
+
+function pollCodexOAuth(oauthState) {
+  clearTimeout(codexOAuthPollTimer)
+  const poll = async () => {
+    if (!oauthState || state.codexOAuthState !== oauthState) return
+    try {
+      const result = await api(`/api/oauth/codex/status?state=${encodeURIComponent(oauthState)}`, { silent: true })
+      const terminal = await handleCodexOAuthStatus(result)
+      if (!terminal) codexOAuthPollTimer = setTimeout(poll, 1500)
+    } catch {
+      codexOAuthPollTimer = setTimeout(poll, 2000)
+    }
+  }
+  codexOAuthPollTimer = setTimeout(poll, 700)
+}
+
+async function handleCodexOAuthStatus(result) {
+  if (result.status === 'done') {
+    clearTimeout(codexOAuthPollTimer)
+    state.codexOAuthState = ''
+    state.codexOAuthAuthUrl = ''
+    setCodexOAuthStatus(`登录完成：${result.connection?.credentialLabel || 'Codex OAuth'}。`, 'success')
+    toast('Codex OAuth 登录成功')
+    await refreshAll()
+    return true
+  }
+  if (result.status === 'error' || result.status === 'cancelled' || result.status === 'unknown') {
+    state.codexOAuthAuthUrl = ''
+    setCodexOAuthStatus(result.error || 'OAuth 登录会话已结束，请重新开始。', 'error')
+    return true
+  }
+  setCodexOAuthStatus(result.status === 'exchanging' ? '授权已收到，正在交换 Token……' : '正在等待浏览器授权……', 'working')
+  if (result.status === 'pending' && state.codexOAuthAuthUrl) showCodexOAuthLink(state.codexOAuthAuthUrl)
+  return false
+}
+
+function setCodexOAuthStatus(message, kind) {
+  const status = $('#codexOAuthStatus')
+  status.className = `oauth-status ${kind || 'idle'}`
+  status.textContent = message
+}
+
+function showCodexOAuthLink(authUrl) {
+  const status = $('#codexOAuthStatus')
+  status.textContent = '浏览器阻止了弹窗。'
+  const link = document.createElement('a')
+  link.href = authUrl
+  link.target = '_blank'
+  link.rel = 'noopener noreferrer'
+  link.textContent = '点击打开登录页面'
+  status.append(' ', link)
+}
+
 function openProviderDialog(provider = null, preferredGroupId = '') {
   state.editingProvider = provider
   const form = $('#providerForm')
@@ -2463,6 +2630,12 @@ function openProviderDialog(provider = null, preferredGroupId = '') {
   formField(form, 'tags').value = provider?.tags?.join(', ') || ''
   formField(form, 'notes').value = provider?.notes || ''
   formField(form, 'enabled').checked = provider ? provider.enabled : true
+  const oauthProvider = provider?.providerType === 'codex_oauth'
+  formField(form, 'baseUrl').readOnly = oauthProvider
+  formField(form, 'authMode').disabled = oauthProvider
+  formField(form, 'wireApi').disabled = oauthProvider
+  $('#credentialEditorTitle').textContent = oauthProvider ? 'OAuth 账号' : 'Key 分组'
+  $('#addCredentialBtn').hidden = oauthProvider
   $('#providerDangerZone').hidden = !provider
   $('#credentialRows').innerHTML = ''
   const credentials = provider?.credentials?.length
@@ -2512,6 +2685,7 @@ async function saveProvider(event) {
   const form = event.currentTarget
   const body = {
     name: formField(form, 'name').value,
+    providerType: state.editingProvider?.providerType || 'openai_compatible',
     groupId: formField(form, 'groupId').value,
     baseUrl: formField(form, 'baseUrl').value,
     credentials: readCredentialRows(),
@@ -2543,18 +2717,24 @@ function addCredentialRow(credential = {}, activeCredentialId = '') {
   const row = document.createElement('div')
   row.className = 'credential-row'
   const id = credential.id || `new-${Date.now()}-${Math.random().toString(16).slice(2)}`
+  const kind = credential.kind || 'api_key'
+  const oauth = kind === 'oauth' || kind === 'access_token'
+  row.dataset.kind = kind
+  row._credential = { ...credential, id, kind }
   row.innerHTML = `
     <label class="radio-label" title="设为当前生效分组">
       <input name="activeCredential" type="radio" value="${escapeHtml(id)}">
       <span>当前</span>
     </label>
     <label>
-      <span>分组名</span>
+      <span>${oauth ? '账号名称' : '分组名'}</span>
       <input name="credentialLabel" required autocomplete="off" placeholder="低倍率分组">
     </label>
     <label>
-      <span>API Key</span>
-      <input name="credentialApiKey" type="password" autocomplete="off">
+      <span>${oauth ? 'OAuth 状态' : 'API Key'}</span>
+      ${oauth
+        ? `<div class="oauth-credential-summary"><strong>${escapeHtml(kind === 'oauth' ? '可自动续期' : '临时 Token')}</strong><small>${escapeHtml(oauthCredentialDetail(credential))}</small></div>`
+        : '<input name="credentialApiKey" type="password" autocomplete="off">'}
     </label>
     <label>
       <span>倍率</span>
@@ -2568,12 +2748,15 @@ function addCredentialRow(credential = {}, activeCredentialId = '') {
       <input name="credentialEnabled" type="checkbox">
       <span>启用</span>
     </label>
-    <button class="icon-btn" type="button" title="移除分组" aria-label="移除分组">×</button>
+    <button class="icon-btn" type="button" title="${oauth ? '移除账号' : '移除分组'}" aria-label="${oauth ? '移除账号' : '移除分组'}">×</button>
     <input name="credentialId" type="hidden" value="${escapeHtml(id)}">
   `
   row.querySelector('[name="credentialLabel"]').value = credential.label || '默认'
-  row.querySelector('[name="credentialApiKey"]').value = ''
-  row.querySelector('[name="credentialApiKey"]').placeholder = credential.apiKeySet ? '留空保持原值' : '请输入 API Key'
+  const apiKeyInput = row.querySelector('[name="credentialApiKey"]')
+  if (apiKeyInput) {
+    apiKeyInput.value = ''
+    apiKeyInput.placeholder = credential.apiKeySet ? '留空保持原值' : '请输入 API Key'
+  }
   row.querySelector('[name="credentialRate"]').value = credential.rate || 1
   row.querySelector('[name="credentialUpstreamGroup"]').value = credential.upstreamGroup || ''
   row.querySelector('[name="credentialEnabled"]').checked = credential.enabled !== false
@@ -2582,7 +2765,7 @@ function addCredentialRow(credential = {}, activeCredentialId = '') {
     : !$('#credentialRows .credential-row')
   row.querySelector('button').addEventListener('click', () => {
     if ($$('.credential-row').length <= 1) {
-      toast('至少保留一个分组')
+      toast(oauth ? '至少保留一个账号；如需全部移除，请删除这条线路' : '至少保留一个分组')
       return
     }
     const wasActive = row.querySelector('[name="activeCredential"]').checked
@@ -2597,13 +2780,24 @@ function addCredentialRow(credential = {}, activeCredentialId = '') {
 
 function readCredentialRows() {
   return $$('.credential-row').map((row) => ({
+    ...(row._credential || {}),
     id: row.querySelector('[name="credentialId"]').value,
     label: row.querySelector('[name="credentialLabel"]').value,
-    apiKey: row.querySelector('[name="credentialApiKey"]').value,
+    kind: row.dataset.kind || 'api_key',
+    apiKey: row.querySelector('[name="credentialApiKey"]')?.value || '',
     enabled: row.querySelector('[name="credentialEnabled"]').checked,
     rate: Number(row.querySelector('[name="credentialRate"]').value),
     upstreamGroup: row.querySelector('[name="credentialUpstreamGroup"]').value,
   }))
+}
+
+function oauthCredentialDetail(credential) {
+  if (credential.authStatus === 'reauth_required') return '需要重新登录'
+  const bits = []
+  if (credential.email) bits.push(credential.email)
+  if (credential.planType) bits.push(credential.planType)
+  if (credential.expiresAt) bits.push(`到期 ${new Date(credential.expiresAt).toLocaleString()}`)
+  return bits.join(' · ') || 'Token 已安全保存'
 }
 
 function bindTargetDragSort() {
@@ -2984,11 +3178,11 @@ function providerStats(entry) {
 function credentialSelect(provider) {
   const credentials = provider.credentials || []
   if (!credentials.length) return '<span class="pill warn">未配置</span>'
-  const enabledCredentials = credentials.filter((credential) => credential.enabled)
+  const enabledCredentials = credentials.filter((credential) => credential.enabled && credential.authStatus !== 'reauth_required')
   const options = (enabledCredentials.length ? enabledCredentials : credentials)
     .map((credential) => `
       <option value="${escapeHtml(credential.id)}" ${credential.id === provider.activeCredentialId ? 'selected' : ''}>
-        ${escapeHtml(credential.label || '默认')}
+        ${escapeHtml(credential.label || '默认')}${credential.kind === 'oauth' ? ' · OAuth' : credential.kind === 'access_token' ? ' · 临时 Token' : ''}
       </option>
     `)
     .join('')
@@ -3003,6 +3197,10 @@ function credentialSelect(provider) {
 function credentialMeta(provider) {
   const credential = (provider.credentials || []).find((item) => item.id === provider.activeCredentialId)
   const bits = []
+  if (credential?.kind === 'oauth') bits.push('OAuth 自动续期')
+  if (credential?.kind === 'access_token') bits.push('临时 Token')
+  if (credential?.authStatus === 'reauth_required') bits.push('需要重新登录')
+  if (credential?.email) bits.push(credential.email)
   if (credential?.upstreamGroup) bits.push(credential.upstreamGroup)
   if (credential?.rate) bits.push(`x${trimNumber(credential.rate)}`)
   return bits.join(' · ') || provider.activeCredentialLabel || provider.apiKeyMasked || ''

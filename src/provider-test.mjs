@@ -1,6 +1,9 @@
 import { execFileSync } from 'node:child_process'
 import { buildCandidates } from './proxy.mjs'
-import { resolveActiveCredential, resolveActiveKey } from './config-store.mjs'
+import { isCredentialUsable, resolveActiveCredential, resolveActiveKey } from './config-store.mjs'
+import { isCodexOAuthCredential } from './oauth/codex-oauth.mjs'
+import { normalizeCodexOAuthRequest } from './oauth/codex-request.mjs'
+import { prepareCredential } from './oauth/token-refresh.mjs'
 import { getCachedSystemProxy, resolveProviderOutboundProxy } from './outbound-proxy.mjs'
 import { hasCompletionPayload, upstreamErrorMessage } from './response-validation.mjs'
 import {
@@ -15,9 +18,9 @@ import { upstreamFetch } from './upstream-fetch.mjs'
 const CODEX_HEADER_TEST_VERSION = '0.144.2'
 let cachedCodexCliVersion = ''
 
-export async function testProvider(provider, model = null, serviceConfig = {}) {
+export async function testProvider(provider, model = null, serviceConfig = {}, runtime = {}) {
   const selectedModel = model || provider.models[0] || 'gpt-4o-mini'
-  const activeCredential = resolveActiveCredential(provider)
+  let activeCredential = resolveActiveCredential(provider)
   if (provider.authMode !== 'none' && !activeCredential) {
     return {
       ok: false,
@@ -29,17 +32,25 @@ export async function testProvider(provider, model = null, serviceConfig = {}) {
       message: 'No enabled credential is available for this provider.',
     }
   }
+  let testProvider = provider
+  try {
+    const prepared = await prepareTestCredential(provider, activeCredential, serviceConfig, runtime)
+    testProvider = prepared.provider
+    activeCredential = prepared.credential
+  } catch (error) {
+    return oauthPreparationFailure(selectedModel, error)
+  }
   const startedAt = Date.now()
   const controller = new AbortController()
   const timeoutMs = resolveTestTimeout(serviceConfig.providerTestTimeoutMs, 3000, 120000, 30000)
   const timeout = setTimeout(() => controller.abort(), timeoutMs)
 
   try {
-    const response = await upstreamFetch(buildModelsUrl(provider.baseUrl), {
+    const response = await upstreamFetch(buildModelsUrl(testProvider), {
       method: 'GET',
-      headers: buildAuthHeaders(provider),
+      headers: buildAuthHeaders(testProvider),
       signal: controller.signal,
-      proxyUrl: resolveProviderProxy(provider, serviceConfig).proxyUrl,
+      proxyUrl: resolveProviderProxy(testProvider, serviceConfig).proxyUrl,
     })
     const parsed = response.ok ? await readModels(response) : { models: [], errorMessage: '' }
     const errorMessage = parsed.errorMessage
@@ -75,9 +86,9 @@ export async function testProvider(provider, model = null, serviceConfig = {}) {
   }
 }
 
-export async function codexCompatibilityTestProvider(provider, input = {}, serviceConfig = {}) {
-  const selectedCredential = selectCredential(provider, String(input.credentialId || ''))
-  const testProvider = selectedCredential ? { ...provider, activeCredentialId: selectedCredential.id } : provider
+export async function codexCompatibilityTestProvider(provider, input = {}, serviceConfig = {}, runtime = {}) {
+  let selectedCredential = selectCredential(provider, String(input.credentialId || ''))
+  let testProvider = selectedCredential ? { ...provider, activeCredentialId: selectedCredential.id } : provider
   const availableModels = availableProviderModels(provider)
   const selectedModel = normalizeText(input.model) || preferredRealTestModel(availableModels)
   const timeoutMs = resolveTestTimeout(serviceConfig.providerRealTestTimeoutMs, 5000, 300000, 90000)
@@ -88,6 +99,17 @@ export async function codexCompatibilityTestProvider(provider, input = {}, servi
   }
   if (!availableModels.includes(selectedModel)) {
     return skippedCodexTest({ selectedModel, reason: 'unsupported_model', message: 'The selected model is not in this provider supported model list.' })
+  }
+  try {
+    const prepared = await prepareTestCredential(provider, selectedCredential, serviceConfig, runtime)
+    testProvider = prepared.provider
+    selectedCredential = prepared.credential
+  } catch (error) {
+    return skippedCodexTest({
+      selectedModel,
+      reason: error?.code || 'oauth_refresh_failed',
+      message: error instanceof Error ? error.message : String(error),
+    })
   }
 
   const codexHeaders = buildCodexTestHeaders(testProvider, normalizeText(input.codexVersion) || resolveLocalCodexVersion())
@@ -101,7 +123,7 @@ export async function codexCompatibilityTestProvider(provider, input = {}, servi
   const ok = response.ok
   return {
     ok,
-    status: ok ? 200 : tool.status || text.status || 0,
+    status: ok ? 200 : response.status || 0,
     model: selectedModel,
     credentialId: selectedCredential?.id || provider.activeCredentialId || '',
     credentialLabel: selectedCredential?.label || '',
@@ -123,9 +145,9 @@ export async function codexCompatibilityTestProvider(provider, input = {}, servi
   }
 }
 
-export async function realTestProvider(provider, input = {}, serviceConfig = {}) {
-  const selectedCredential = selectCredential(provider, String(input.credentialId || ''))
-  const testProvider = selectedCredential
+export async function realTestProvider(provider, input = {}, serviceConfig = {}, runtime = {}) {
+  let selectedCredential = selectCredential(provider, String(input.credentialId || ''))
+  let testProvider = selectedCredential
     ? { ...provider, activeCredentialId: selectedCredential.id }
     : provider
   const availableModels = availableProviderModels(provider)
@@ -167,6 +189,20 @@ export async function realTestProvider(provider, input = {}, serviceConfig = {})
       wireApi,
       reason: 'unsupported_model',
       message: 'The selected model is not in this provider supported model list.',
+    })
+  }
+  try {
+    const prepared = await prepareTestCredential(provider, selectedCredential, serviceConfig, runtime)
+    testProvider = prepared.provider
+    selectedCredential = prepared.credential
+  } catch (error) {
+    return skippedRealTestResult({
+      provider,
+      selectedCredential,
+      selectedModel,
+      wireApi,
+      reason: error?.code || 'oauth_refresh_failed',
+      message: error instanceof Error ? error.message : String(error),
     })
   }
 
@@ -222,10 +258,14 @@ async function sendCodexResponses(provider, model, body, serviceConfig, timeoutM
     const plan = buildWirePlan(requestUrl, provider)
     const headers = requestHeaders || buildAuthHeaders(provider)
     headers.set('content-type', 'application/json')
+    const builtBody = buildWireBody(body, { provider, model }, { collectUsage: false, collectStreamUsage: false }, plan)
+    const upstreamBody = provider.providerType === 'codex_oauth'
+      ? normalizeCodexOAuthRequest(builtBody, { sessionId: resolveActiveCredential(provider)?.id })
+      : builtBody
     const response = await upstreamFetch(buildWireUrl(provider.baseUrl, requestUrl, plan), {
       method: 'POST',
       headers,
-      body: JSON.stringify(buildWireBody(body, { provider, model }, { collectUsage: false, collectStreamUsage: false }, plan)),
+      body: JSON.stringify(upstreamBody),
       signal: controller.signal,
       proxyUrl: resolveProviderProxy(provider, serviceConfig).proxyUrl,
     })
@@ -362,13 +402,16 @@ async function sendChatCompletion(provider, model, prompt, maxTokens, tokenField
   try {
     const requestUrl = '/v1/chat/completions'
     const plan = buildWirePlan(requestUrl, { ...provider, wireApi })
-    const body = buildWireBody({
+    const builtBody = buildWireBody({
       model,
       messages: [{ role: 'user', content: prompt }],
       temperature: 0,
       stream: true,
       [tokenField]: maxTokens,
     }, { provider, model }, { collectUsage: false, collectStreamUsage: false }, plan)
+    const body = provider.providerType === 'codex_oauth'
+      ? normalizeCodexOAuthRequest(builtBody, { sessionId: resolveActiveCredential(provider)?.id })
+      : builtBody
     const headers = buildAuthHeaders(provider)
     headers.set('content-type', 'application/json')
 
@@ -493,7 +536,11 @@ function resolveTestTimeout(value, min, max, fallback) {
   return clampInteger(value, min, max, fallback)
 }
 
-function buildModelsUrl(baseUrl) {
+function buildModelsUrl(provider) {
+  const baseUrl = provider.baseUrl
+  if (provider.providerType === 'codex_oauth') {
+    return `${baseUrl.replace(/\/+$/, '')}/models?client_version=${encodeURIComponent(CODEX_HEADER_TEST_VERSION)}`
+  }
   const parsedBase = new URL(baseUrl)
   const trimmedPath = parsedBase.pathname.replace(/\/+$/, '')
   const normalized = trimmedPath === '' ? `${parsedBase.origin}/v1` : baseUrl.replace(/\/+$/, '')
@@ -516,7 +563,7 @@ export function previewRoute(config, stateStore, model) {
   }))
 }
 
-export async function realTestRoute(config, stateStore, input = {}, serviceConfig = {}) {
+export async function realTestRoute(config, stateStore, input = {}, serviceConfig = {}, runtime = {}) {
   const virtualModel = normalizeText(input.model)
   const route = config.routes.find((item) => item.enabled && item.virtualModel === virtualModel) || null
   const candidates = buildCandidates(config, route, virtualModel, stateStore)
@@ -559,10 +606,11 @@ export async function realTestRoute(config, stateStore, input = {}, serviceConfi
   for (const candidate of candidates.slice(0, Number(serviceConfig.maxAttempts) || candidates.length)) {
     const result = await realTestProvider(candidate.provider, {
       model: candidate.model,
+      credentialId: candidate.credential?.id || '',
       prompt: input.prompt,
       maxTokens: input.maxTokens,
       wireApi: input.wireApi || candidate.provider.wireApi,
-    }, serviceConfig)
+    }, serviceConfig, runtime)
     const attempt = {
       providerId: candidate.provider.id,
       providerName: candidate.provider.name,
@@ -614,11 +662,21 @@ export async function realTestRoute(config, stateStore, input = {}, serviceConfi
 function buildAuthHeaders(provider) {
   const headers = new Headers()
   const apiKey = resolveActiveKey(provider)
+  const credential = resolveActiveCredential(provider)
   if (apiKey && (provider.authMode === 'authorization' || provider.authMode === 'both')) {
     headers.set('authorization', `Bearer ${apiKey}`)
   }
   if (apiKey && (provider.authMode === 'x-api-key' || provider.authMode === 'both')) {
     headers.set('x-api-key', apiKey)
+  }
+  if (provider.providerType === 'codex_oauth' && isCodexOAuthCredential(credential)) {
+    headers.set('authorization', `Bearer ${credential.accessToken}`)
+    headers.delete('x-api-key')
+    headers.set('originator', 'codex_cli_rs')
+    headers.set('user-agent', `codex_cli_rs/${CODEX_HEADER_TEST_VERSION}`)
+    headers.set('version', CODEX_HEADER_TEST_VERSION)
+    headers.set('session_id', credential.id || 'local-model-relay-test')
+    if (credential.accountId) headers.set('chatgpt-account-id', credential.accountId)
   }
   return headers
 }
@@ -626,11 +684,39 @@ function buildAuthHeaders(provider) {
 function selectCredential(provider, credentialId) {
   const credentials = Array.isArray(provider.credentials) ? provider.credentials : []
   return (
-    credentials.find((credential) => credential.id === credentialId && credential.enabled) ||
-    credentials.find((credential) => credential.id === provider.activeCredentialId && credential.enabled) ||
-    credentials.find((credential) => credential.enabled) ||
+    credentials.find((credential) => credential.id === credentialId && isCredentialUsable(credential)) ||
+    credentials.find((credential) => credential.id === provider.activeCredentialId && isCredentialUsable(credential)) ||
+    credentials.find((credential) => isCredentialUsable(credential)) ||
     null
   )
+}
+
+async function prepareTestCredential(provider, credential, serviceConfig, runtime) {
+  const selectedProvider = credential ? { ...provider, activeCredentialId: credential.id } : provider
+  if (!credential || !isCodexOAuthCredential(credential) || !runtime?.configStore) {
+    return { provider: selectedProvider, credential }
+  }
+  const prepared = await prepareCredential(runtime.configStore, provider, credential, serviceConfig, {
+    oauthConfig: runtime.oauthConfig,
+    fetchImpl: runtime.fetchImpl,
+  })
+  const latestProvider = runtime.configStore.get().providers.find((item) => item.id === provider.id) || provider
+  return {
+    provider: { ...latestProvider, activeCredentialId: prepared.id },
+    credential: prepared,
+  }
+}
+
+function oauthPreparationFailure(model, error) {
+  return {
+    ok: false,
+    status: 0,
+    latencyMs: 0,
+    model,
+    models: [],
+    reason: error?.code || 'oauth_refresh_failed',
+    message: error instanceof Error ? error.message : String(error),
+  }
 }
 
 async function safeText(response) {
@@ -719,11 +805,12 @@ async function readModels(response) {
     const text = await response.text()
     const payload = parseJson(text)
     const errorMessage = upstreamErrorMessage(payload)
-    if (!payload || !Array.isArray(payload.data)) {
+    const source = Array.isArray(payload?.data) ? payload.data : Array.isArray(payload?.models) ? payload.models : null
+    if (!source) {
       return { models: [], valid: false, errorMessage: errorMessage || preview(text || 'Invalid /v1/models response.') }
     }
-    const models = [...new Set(payload.data
-      .map((item) => (typeof item?.id === 'string' ? item.id.trim() : ''))
+    const models = [...new Set(source
+      .map((item) => (typeof item?.id === 'string' ? item.id.trim() : typeof item?.slug === 'string' ? item.slug.trim() : ''))
       .filter(Boolean))]
       .sort()
     return { models, valid: true, errorMessage }

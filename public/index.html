@@ -142,15 +142,15 @@
                 </div>
                 <canvas id="tokenTrendChart" height="118"></canvas>
               </div>
-              <div class="chart-card">
-              <div class="chart-head">
-                <h3>模型分布</h3>
-                <span>Top 8</span>
-              </div>
-              <div class="share-chart-layout">
-                <div class="share-chart-plot"><canvas id="modelShareChart"></canvas></div>
-                <div id="modelShareLegend" class="share-chart-legend" aria-label="模型 Token 占比图例"></div>
-              </div>
+              <div class="chart-card model-share-card">
+                <div class="chart-head">
+                  <h3>模型分布</h3>
+                  <span>Top 8</span>
+                </div>
+                <div class="share-chart-layout">
+                  <div class="share-chart-plot"><canvas id="modelShareChart"></canvas></div>
+                  <div id="modelShareLegend" class="share-chart-legend" aria-label="模型 Token 占比图例"></div>
+                </div>
               </div>
               <div class="chart-card recent-card">
                 <div class="chart-head">
@@ -171,6 +171,7 @@
             </div>
             <div class="panel-tools">
               <button id="manageProviderGroupsBtn" class="ghost" type="button">管理分组</button>
+              <button id="codexOAuthBtn" class="ghost oauth-entry-btn" type="button">Codex OAuth</button>
               <button id="newProviderBtn" class="primary" type="button">新增线路</button>
             </div>
           </div>
@@ -795,7 +796,7 @@
         </label>
         <section class="credential-editor">
           <div class="section-head">
-            <span>Key 分组</span>
+            <span id="credentialEditorTitle">Key 分组</span>
             <button id="addCredentialBtn" class="ghost" type="button">添加分组</button>
           </div>
           <div id="credentialRows" class="credential-rows"></div>
@@ -1046,6 +1047,62 @@
           <button type="button" class="ghost close-dialog">取消</button>
         </div>
       </form>
+    </dialog>
+
+    <dialog id="codexOAuthDialog" class="oauth-dialog">
+      <div class="dialog-body">
+        <div class="dialog-head">
+          <div>
+            <h2>Codex OAuth</h2>
+            <p>登录账号会保存为专用 Codex OAuth 线路下的凭据，并支持自动续期与账号内故障转移。</p>
+          </div>
+          <button class="icon-btn close-dialog" type="button" title="关闭" aria-label="关闭">×</button>
+        </div>
+        <div class="oauth-notice">
+          <strong>仅供本机个人使用</strong>
+          <span>OAuth 会话比普通 API Key 更敏感，也可能受到上游订阅条款和账号策略限制。普通中转线路不会受此功能影响。</span>
+        </div>
+        <label>
+          <span>添加到</span>
+          <select id="codexOAuthProviderSelect">
+            <option value="">自动创建或使用 Codex OAuth 线路</option>
+          </select>
+        </label>
+        <section class="oauth-login-card">
+          <div class="section-head">
+            <div>
+              <strong>浏览器登录</strong>
+              <span>使用 PKCE 授权，成功后可自动刷新 Token。</span>
+            </div>
+            <button id="startCodexOAuthBtn" class="primary" type="button">开始登录</button>
+          </div>
+          <div id="codexOAuthStatus" class="oauth-status idle">尚未开始登录。</div>
+          <div id="codexOAuthManual" class="oauth-manual" hidden>
+            <label>
+              <span>手工回调地址</span>
+              <input id="codexOAuthCallbackUrl" autocomplete="off" placeholder="粘贴浏览器地址栏中的 http://localhost:1455/auth/callback?...">
+            </label>
+            <button id="completeCodexOAuthBtn" class="ghost" type="button">完成回调</button>
+          </div>
+        </section>
+        <section class="oauth-import-card">
+          <div class="section-head">
+            <div>
+              <strong>OAuth JSON 导入</strong>
+              <span>支持单个对象、数组或 { accounts: [...] }；仅有 accessToken 时无法自动续期。</span>
+            </div>
+          </div>
+          <textarea id="codexOAuthImportJson" rows="7" spellcheck="false" placeholder='{"accessToken":"...","refreshToken":"...","idToken":"..."}'></textarea>
+          <div class="oauth-import-actions">
+            <span>导入结果不会回显任何 Token。</span>
+            <button id="importCodexOAuthBtn" class="ghost" type="button">导入 JSON</button>
+          </div>
+        </section>
+        <div class="form-actions">
+          <button id="cancelCodexOAuthBtn" class="ghost" type="button">取消当前登录</button>
+          <button type="button" class="ghost close-dialog">关闭</button>
+        </div>
+      </div>
     </dialog>
 
     <dialog id="errorDetailDialog" class="error-detail-dialog">

@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 4,
   "service": {
     "enabled": true,
     "listenHost": "127.0.0.1",

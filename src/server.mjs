@@ -10,9 +10,11 @@ import { codexCompatibilityTestProvider, previewRoute, realTestProvider, realTes
 import { fetchSpeedTestModels, runSpeedTest } from './speed-test.mjs'
 import { describeRoutingSkip, describeUpstreamFailure, redactSecretText } from './upstream-diagnostics.mjs'
 import { diagnoseLog, testDiagnosticsLlm } from './diagnostics-llm.mjs'
+import { CodexOAuthManager } from './oauth/codex-oauth-manager.mjs'
 
 const configStore = new ConfigStore()
 const stateStore = new StateStore()
+const codexOAuthManager = new CodexOAuthManager(configStore)
 const runtimeConfig = configStore.get()
 const runtimeListenHost = normalizeRuntimeHost(process.env.LOCAL_MODEL_RELAY_HOST, runtimeConfig.service.listenHost)
 const runtimeListenPort = normalizeRuntimePort(process.env.LOCAL_MODEL_RELAY_PORT, runtimeConfig.service.listenPort)
@@ -165,6 +167,35 @@ async function routeRequest(req, res) {
     return sendJson(res, 200, configStore.setEnabled(Boolean(body.enabled)))
   }
 
+  if (url.pathname === '/api/oauth/codex/start' && req.method === 'POST') {
+    return sendJson(res, 200, await codexOAuthManager.start(await readJson(req)))
+  }
+
+  if (url.pathname === '/api/oauth/codex/status' && req.method === 'GET') {
+    return sendJson(res, 200, codexOAuthManager.status(url.searchParams.get('state') || ''))
+  }
+
+  if (url.pathname === '/api/oauth/codex/complete' && req.method === 'POST') {
+    try {
+      return sendJson(res, 200, await codexOAuthManager.complete(await readJson(req)))
+    } catch (error) {
+      throw new HttpError(400, 'oauth_completion_failed', error instanceof Error ? error.message : String(error))
+    }
+  }
+
+  if (url.pathname === '/api/oauth/codex/cancel' && req.method === 'POST') {
+    const body = await readJson(req)
+    return sendJson(res, 200, codexOAuthManager.cancel(String(body.state || '')))
+  }
+
+  if (url.pathname === '/api/oauth/codex/import' && req.method === 'POST') {
+    try {
+      return sendJson(res, 200, codexOAuthManager.importAccounts(await readJson(req)))
+    } catch (error) {
+      throw new HttpError(400, 'oauth_import_failed', error instanceof Error ? error.message : String(error))
+    }
+  }
+
   if (url.pathname === '/api/provider-groups' && req.method === 'POST') {
     return sendJson(res, 201, configStore.createProviderGroup(await readJson(req)))
   }
@@ -202,7 +233,7 @@ async function routeRequest(req, res) {
     const config = configStore.get()
     const provider = config.providers.find((item) => item.id === providerTestMatch[1])
     if (!provider) throw new HttpError(404, 'provider_not_found', 'Provider not found.')
-    const result = await testProvider(provider, null, config.service)
+    const result = await testProvider(provider, null, config.service, { configStore })
     recordProviderTestResult(provider, result)
     return sendJson(res, 200, result)
   }
@@ -212,7 +243,7 @@ async function routeRequest(req, res) {
     const config = configStore.get()
     const provider = config.providers.find((item) => item.id === providerRealTestMatch[1])
     if (!provider) throw new HttpError(404, 'provider_not_found', 'Provider not found.')
-    const result = await realTestProvider(provider, await readJson(req), config.service)
+    const result = await realTestProvider(provider, await readJson(req), config.service, { configStore })
     if (!result.skipped) recordRealTestResult(provider, result)
     return sendJson(res, 200, result)
   }
@@ -222,7 +253,7 @@ async function routeRequest(req, res) {
     const config = configStore.get()
     const provider = config.providers.find((item) => item.id === providerCodexTestMatch[1])
     if (!provider) throw new HttpError(404, 'provider_not_found', 'Provider not found.')
-    const result = await codexCompatibilityTestProvider(provider, await readJson(req), config.service)
+    const result = await codexCompatibilityTestProvider(provider, await readJson(req), config.service, { configStore })
     if (!result.skipped) {
       const current = provider.capabilities && typeof provider.capabilities === 'object' ? provider.capabilities : {}
       const codex = current.codex && typeof current.codex === 'object' ? current.codex : {}
@@ -261,7 +292,7 @@ async function routeRequest(req, res) {
     const result = await realTestRoute(config, stateStore, {
       ...(await readJson(req)),
       model: route.virtualModel,
-    }, config.service)
+    }, config.service, { configStore })
     recordRouteTestResult(result)
     return sendJson(res, 200, result)
   }
@@ -289,7 +320,7 @@ async function routeRequest(req, res) {
   if (url.pathname === '/api/process/exit' && req.method === 'POST') {
     sendJson(res, 200, { ok: true })
     relayLog('shutdown requested through the management API')
-    setTimeout(() => process.exit(0), 150)
+    setTimeout(() => codexOAuthManager.close().finally(() => process.exit(0)), 150)
     return
   }
 

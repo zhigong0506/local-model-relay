@@ -1,4 +1,9 @@
-import { resolveActiveCredential, resolveActiveKey } from './config-store.mjs'
+import {
+  credentialSecret,
+  isCredentialUsable,
+  resolveActiveCredential,
+  resolveActiveKey,
+} from './config-store.mjs'
 import { getCachedSystemProxy, resolveProviderOutboundProxy } from './outbound-proxy.mjs'
 import { upstreamErrorMessage } from './response-validation.mjs'
 import { buildReasoningFallback } from './reasoning-fallback.mjs'
@@ -12,6 +17,9 @@ import {
   transformWireResponse,
 } from './wire-api.mjs'
 import { upstreamFetch } from './upstream-fetch.mjs'
+import { isCodexOAuthCredential } from './oauth/codex-oauth.mjs'
+import { normalizeCodexOAuthRequest, resolveCodexOAuthSessionId } from './oauth/codex-request.mjs'
+import { CredentialRefreshError, prepareCredential } from './oauth/token-refresh.mjs'
 
 const HOP_BY_HOP_HEADERS = new Set([
   'connection',
@@ -151,18 +159,24 @@ export async function handleProxyRequest(req, res, context) {
   }
 
   for (const candidate of candidates.slice(0, config.service.maxAttempts)) {
-      const attempt = {
+    let credential = candidate.credential || null
+    const attempt = {
         providerId: candidate.provider.id,
         providerName: candidate.provider.name,
-        credentialId: resolveActiveCredential(candidate.provider)?.id || '',
-        credentialLabel: resolveActiveCredential(candidate.provider)?.label || '',
+        credentialId: credential?.id || '',
+        credentialLabel: credential?.label || '',
+        credentialKind: credential?.kind || '',
         model: candidate.model,
         startedAt: Date.now(),
-      }
+    }
     attempts.push(attempt)
     stateStore.markAttempt(candidate.provider.id)
 
     try {
+      if (credential) {
+        credential = await prepareCredential(configStore, candidate.provider, credential, config.service)
+        candidate.credential = credential
+      }
       let requestBody = body
       let upstream = await callUpstream(req, requestBody, candidate, config.service)
       let upstreamResponse = upstream.response
@@ -173,10 +187,42 @@ export async function handleProxyRequest(req, res, context) {
       let streamInfo = null
       let responseId = ''
 
+      let authRefresh = null
+      if ([401, 403].includes(upstreamResponse.status) && isOAuthCredential(credential) && credential.refreshToken) {
+        try {
+          const refreshed = await prepareCredential(configStore, candidate.provider, credential, config.service, { force: true })
+          upstream.abort()
+          credential = refreshed
+          candidate.credential = refreshed
+          authRefresh = { attempted: true, ok: true }
+          attempt.authRefresh = authRefresh
+          upstream = await callUpstream(req, requestBody, candidate, config.service)
+          upstreamResponse = upstream.response
+          latencyMs = Date.now() - attempt.startedAt
+          attempt.status = upstreamResponse.status
+          attempt.latencyMs = latencyMs
+        } catch (error) {
+          authRefresh = {
+            attempted: true,
+            ok: false,
+            code: error?.code || 'oauth_refresh_failed',
+            permanent: error?.permanent === true,
+          }
+          attempt.authRefresh = authRefresh
+        }
+      }
+
+      if (shouldRequireOAuthReauth(upstreamResponse.status, credential, authRefresh)) {
+        configStore.updateCredentialAuth(candidate.provider.id, credential.id, {
+          authStatus: 'reauth_required',
+          lastAuthError: 'HTTP 401',
+        })
+      }
+
       if (upstreamResponse.status >= 400) {
         const firstFailureMessage = redactSecretText(
           await readPreview(upstreamResponse.clone(), null, candidate.provider.timeoutMs),
-          resolveActiveKey(candidate.provider),
+          credentialSecret(credential),
         )
         const fallback = buildReasoningFallback(body, {
           status: upstreamResponse.status,
@@ -202,7 +248,7 @@ export async function handleProxyRequest(req, res, context) {
       if (shouldRetryStatus(upstreamResponse.status, config.service.retryStatusCodes)) {
         const message = redactSecretText(
           await readPreview(upstreamResponse, upstream.abort, candidate.provider.timeoutMs),
-          resolveActiveKey(candidate.provider),
+          credentialSecret(credential),
         )
         const diagnostic = describeUpstreamFailure(upstreamResponse.status, message)
         attempt.error = message
@@ -232,7 +278,7 @@ export async function handleProxyRequest(req, res, context) {
         upstream.abort()
         const message = redactSecretText(
           streamError instanceof Error ? streamError.message : String(streamError),
-          resolveActiveKey(candidate.provider),
+          credentialSecret(credential),
         )
         capturedUsage = capturedUsage || streamError?.usage || null
         streamInfo = streamInfo || streamError?.stream || null
@@ -354,6 +400,9 @@ export async function handleProxyRequest(req, res, context) {
           latencyMs,
         })
         stateStore.advanceStartProvider?.(candidate.provider.id)
+        if (isOAuthCredential(credential) && candidate.provider.activeCredentialId !== credential.id) {
+          configStore.setActiveCredential(candidate.provider.id, credential.id)
+        }
         persistSessionAffinity(
           stateStore,
           sessionContext,
@@ -402,22 +451,23 @@ export async function handleProxyRequest(req, res, context) {
       const latencyMs = Date.now() - attempt.startedAt
       const message = redactSecretText(
         error instanceof Error ? error.message : String(error),
-        resolveActiveKey(candidate.provider),
+        credentialSecret(credential),
       )
-      attempt.status = 0
+      const authFailure = error instanceof CredentialRefreshError
+      attempt.status = authFailure ? 401 : 0
       attempt.latencyMs = latencyMs
       attempt.error = message
-      attempt.outcome = 'upstream_error'
-      attempt.diagnostic = describeUpstreamFailure(0, message, '', {
+      attempt.outcome = authFailure ? 'oauth_refresh_failed' : 'upstream_error'
+      attempt.diagnostic = describeUpstreamFailure(authFailure ? 401 : 0, message, '', {
         timedOut: error?.name === 'AbortError',
       })
       stateStore.markFailure(candidate.provider.id, {
-        status: 0,
+        status: authFailure ? 401 : 0,
         message,
         latencyMs,
         cooldownSeconds: candidate.provider.cooldownSeconds,
       })
-      lastError = { status: 0, message, diagnostic: attempt.diagnostic }
+      lastError = { status: authFailure ? 401 : 0, message, diagnostic: attempt.diagnostic }
     }
   }
 
@@ -481,7 +531,7 @@ function buildCandidateContext(config, route, virtualModel, stateStore, preferre
         diagnostics.push(describeRoutingSkip(provider, reason, target.model))
         continue
       }
-      candidates.push({ provider, model: target.model })
+      candidates.push(...providerCredentialCandidates(provider, target.model))
     }
     return finalizeCandidateContext(candidates, diagnostics, providersById, route, virtualModel, routing, preferredProviderId)
   }
@@ -492,7 +542,7 @@ function buildCandidateContext(config, route, virtualModel, stateStore, preferre
       diagnostics.push(describeRoutingSkip(provider, reason, virtualModel))
       continue
     }
-    candidates.push({ provider, model: virtualModel })
+    candidates.push(...providerCredentialCandidates(provider, virtualModel))
   }
 
   return finalizeCandidateContext(candidates, diagnostics, providersById, route, virtualModel, routing, preferredProviderId)
@@ -506,8 +556,8 @@ function finalizeCandidateContext(candidates, diagnostics, providersById, route,
       providerId: pinnedProviderId,
       providerName: provider?.name || '',
     }
-    const candidate = candidates.find((item) => item.provider.id === pinnedProviderId)
-    if (candidate) return { candidates: [candidate], diagnostics, pinned, routing }
+    const pinnedCandidates = candidates.filter((item) => item.provider.id === pinnedProviderId)
+    if (pinnedCandidates.length) return { candidates: pinnedCandidates, diagnostics, pinned, routing }
 
     diagnostics.push(describePinnedStartUnavailable(provider, route, virtualModel))
     return { candidates: [], diagnostics, pinned, routing }
@@ -558,6 +608,32 @@ function providerSkipReason(provider, stateStore, now, virtualModel = null) {
   if (stateStore.isCooling(provider.id, now)) return 'cooldown'
   if (virtualModel !== null && provider.models.length > 0 && !provider.models.includes(virtualModel)) return 'unsupported_model'
   return ''
+}
+
+function providerCredentialCandidates(provider, model) {
+  if (provider.authMode === 'none') return [{ provider, credential: null, model }]
+  const active = resolveActiveCredential(provider)
+  if (!active) return []
+  if (!isOAuthCredential(active)) return [{ provider, credential: active, model }]
+
+  const oauthCredentials = (provider.credentials || []).filter((credential) => (
+    isCredentialUsable(credential) && isOAuthCredential(credential)
+  ))
+  const index = oauthCredentials.findIndex((credential) => credential.id === active.id)
+  const ordered = index > 0
+    ? [...oauthCredentials.slice(index), ...oauthCredentials.slice(0, index)]
+    : oauthCredentials
+  return ordered.map((credential) => ({ provider, credential, model }))
+}
+
+export function shouldRequireOAuthReauth(status, credential, authRefresh = null) {
+  if (status !== 401 || !isOAuthCredential(credential)) return false
+  if (!credential.refreshToken) return true
+  return authRefresh?.ok === true || authRefresh?.permanent === true
+}
+
+function isOAuthCredential(credential) {
+  return isCodexOAuthCredential(credential)
 }
 
 function resolveSessionContext(req, body, stateStore, serviceConfig) {
@@ -671,12 +747,18 @@ async function callUpstream(req, body, candidate, serviceConfig) {
   const timeout = setTimeout(() => controller.abort(), candidate.provider.timeoutMs)
   const wirePlan = buildWirePlan(req.url, candidate.provider)
   const upstreamUrl = buildWireUrl(candidate.provider.baseUrl, req.url, wirePlan)
-  const upstreamBody = buildWireBody(body, candidate, serviceConfig, wirePlan)
+  const builtBody = buildWireBody(body, candidate, serviceConfig, wirePlan)
+  const codexSessionId = candidate.provider.providerType === 'codex_oauth'
+    ? resolveCodexOAuthSessionId(req.headers, body)
+    : ''
+  const upstreamBody = candidate.provider.providerType === 'codex_oauth'
+    ? normalizeCodexOAuthRequest(builtBody, { sessionId: codexSessionId })
+    : builtBody
 
   try {
     const response = await upstreamFetch(upstreamUrl, {
       method: req.method,
-      headers: buildHeaders(req.headers, candidate.provider),
+      headers: buildHeaders(req.headers, candidate.provider, candidate.credential, { codexSessionId }),
       body: JSON.stringify(upstreamBody),
       signal: controller.signal,
       proxyUrl: resolveProviderOutboundProxy(candidate.provider, serviceConfig, {
@@ -694,9 +776,9 @@ async function callUpstream(req, body, candidate, serviceConfig) {
   }
 }
 
-function buildHeaders(source, provider) {
+function buildHeaders(source, provider, credential = resolveActiveCredential(provider), options = {}) {
   const headers = new Headers()
-  const apiKey = resolveActiveKey(provider)
+  const apiKey = credentialSecret(credential)
 
   for (const [name, value] of Object.entries(source)) {
     const lower = name.toLowerCase()
@@ -716,6 +798,16 @@ function buildHeaders(source, provider) {
 
   if (apiKey && (provider.authMode === 'x-api-key' || provider.authMode === 'both')) {
     headers.set('x-api-key', apiKey)
+  }
+
+  if (provider.providerType === 'codex_oauth' && isCodexOAuthCredential(credential)) {
+    headers.set('authorization', `Bearer ${credential.accessToken}`)
+    headers.delete('x-api-key')
+    headers.set('originator', 'codex_cli_rs')
+    headers.set('user-agent', 'codex_cli_rs/0.144.2')
+    headers.set('version', '0.144.2')
+    headers.set('session_id', options.codexSessionId || headers.get('session_id') || credential.id || 'local-model-relay')
+    if (credential.accountId) headers.set('chatgpt-account-id', credential.accountId)
   }
 
   return headers

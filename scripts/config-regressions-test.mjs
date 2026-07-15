@@ -26,9 +26,11 @@ try {
   }), 'utf8')
   const legacyStore = new ConfigStore(legacyConfigFile)
   const migratedConfig = legacyStore.get()
-  assert.equal(migratedConfig.version, 3)
+  assert.equal(migratedConfig.version, 4)
   assert.deepEqual(migratedConfig.providerGroups.map((group) => group.id), ['openai', 'deepseek'])
   assert.equal(migratedConfig.providers[0].groupId, 'openai')
+  assert.equal(migratedConfig.providers[0].providerType, 'openai_compatible')
+  assert.equal(migratedConfig.providers[0].credentials[0].kind, 'api_key')
 
   const store = new ConfigStore(configFile)
   assert.deepEqual(store.get().providerGroups.map((group) => group.id), ['openai', 'deepseek'])
@@ -129,6 +131,65 @@ try {
   const afterGroupDelete = store.deleteProviderGroup(customGroup.id)
   assert.equal(afterGroupDelete.providerGroups.some((group) => group.id === customGroup.id), false)
 
+  const firstOAuth = store.upsertCodexOAuthCredential('', {
+    kind: 'oauth',
+    accessToken: fakeJwt({ email: 'oauth@example.test', account_id: 'workspace-a' }),
+    refreshToken: 'refresh-secret-a',
+    idToken: fakeJwt({
+      email: 'oauth@example.test',
+      'https://api.openai.com/auth': {
+        chatgpt_account_id: 'workspace-a',
+        chatgpt_plan_type: 'plus',
+      },
+    }),
+    expiresAt: new Date(Date.now() + 3600000).toISOString(),
+    lastRefreshAt: new Date().toISOString(),
+    email: 'oauth@example.test',
+    accountId: 'workspace-a',
+    planType: 'plus',
+  })
+  const secondOAuth = store.upsertCodexOAuthCredential(firstOAuth.provider.id, {
+    kind: 'oauth',
+    accessToken: fakeJwt({ email: 'oauth2@example.test', account_id: 'workspace-b' }),
+    refreshToken: 'refresh-secret-b',
+    email: 'oauth2@example.test',
+    accountId: 'workspace-b',
+  })
+  const updatedFirstOAuth = store.upsertCodexOAuthCredential(firstOAuth.provider.id, {
+    kind: 'oauth',
+    accessToken: fakeJwt({ email: 'oauth@example.test', account_id: 'workspace-a' }),
+    refreshToken: 'refresh-secret-a-rotated',
+    email: 'oauth@example.test',
+    accountId: 'workspace-a',
+  })
+  assert.equal(updatedFirstOAuth.credential.id, firstOAuth.credential.id)
+  const oauthProvider = store.get().providers.find((provider) => provider.id === firstOAuth.provider.id)
+  assert.equal(oauthProvider.providerType, 'codex_oauth')
+  assert.equal(oauthProvider.baseUrl, 'https://chatgpt.com/backend-api/codex')
+  assert.equal(oauthProvider.credentials.length, 2)
+  assert.equal(oauthProvider.credentials.find((item) => item.id === firstOAuth.credential.id).refreshToken, 'refresh-secret-a-rotated')
+  assert.throws(
+    () => store.updateProvider(oauthProvider.id, { baseUrl: 'https://example.invalid/codex' }),
+    (error) => error?.status === 400 && error?.code === 'invalid_provider',
+  )
+  assert.throws(
+    () => store.updateProvider(oauthProvider.id, { providerType: 'openai_compatible' }),
+    (error) => error?.status === 400 && error?.code === 'invalid_provider',
+  )
+  const publicOAuth = store.getPublic().providers.find((provider) => provider.id === firstOAuth.provider.id)
+  assert.equal(publicOAuth.credentials[0].accessToken, undefined)
+  assert.equal(publicOAuth.credentials[0].refreshToken, undefined)
+  assert.equal(publicOAuth.credentials.every((credential) => credential.accessTokenSet), true)
+  const redactedExport = JSON.stringify(store.exportConfig(false))
+  assert.equal(redactedExport.includes('refresh-secret-a-rotated'), false)
+  assert.equal(redactedExport.includes('refresh-secret-b'), false)
+  const oauthCandidates = buildCandidates(store.get(), null, 'oauth-model', {
+    isCooling: () => false,
+    getStartProviderId: () => firstOAuth.provider.id,
+  }).filter((candidate) => candidate.provider.id === firstOAuth.provider.id)
+  assert.equal(oauthCandidates.length, 2)
+  assert.deepEqual(oauthCandidates.map((candidate) => candidate.credential.id), [firstOAuth.credential.id, secondOAuth.credential.id])
+
   console.log(JSON.stringify({
     ok: true,
     legacyProvidersMigratedToOpenAi: true,
@@ -143,7 +204,18 @@ try {
     duplicateRouteUpdateRejected: true,
     duplicateRouteImportRejected: true,
     listenPortUpperBoundApplied: true,
+    oauthCredentialsMigratedAndRedacted: true,
+    oauthWorkspaceDedupeApplied: true,
+    oauthAccountCandidatesExpanded: true,
   }, null, 2))
 } finally {
   await rm(workDir, { recursive: true, force: true })
+}
+
+function fakeJwt(payload) {
+  return [
+    Buffer.from(JSON.stringify({ alg: 'none', typ: 'JWT' })).toString('base64url'),
+    Buffer.from(JSON.stringify(payload)).toString('base64url'),
+    'signature',
+  ].join('.')
 }

@@ -373,7 +373,7 @@ main {
 
 .chart-grid {
   display: grid;
-  grid-template-columns: minmax(0, 1.15fr) minmax(330px, 0.85fr);
+  grid-template-columns: minmax(0, 1.2fr) minmax(330px, 0.8fr);
   gap: 14px;
 }
 
@@ -860,6 +860,114 @@ dialog::backdrop {
   min-height: 40px;
 }
 
+.oauth-entry-btn {
+  border-color: #cfc7ee;
+  background: #f5f2ff;
+  color: #5f52a6;
+}
+
+.oauth-dialog {
+  width: min(760px, calc(100vw - 48px));
+}
+
+.oauth-dialog .dialog-head p {
+  margin: 5px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.oauth-notice,
+.oauth-login-card,
+.oauth-import-card {
+  display: grid;
+  gap: 11px;
+  padding: 14px;
+  border: 1px solid #ddd8ed;
+  border-radius: 14px;
+  background: #f8f7fc;
+}
+
+.oauth-notice strong,
+.oauth-login-card .section-head strong,
+.oauth-import-card .section-head strong {
+  color: #534b8f;
+}
+
+.oauth-notice span,
+.oauth-login-card .section-head span,
+.oauth-import-card .section-head span,
+.oauth-import-actions span {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.oauth-login-card .section-head > div,
+.oauth-import-card .section-head > div {
+  display: grid;
+  gap: 3px;
+}
+
+.oauth-status {
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.oauth-status.working { border-color: #b8d8d1; color: #16735f; }
+.oauth-status.success { border-color: #9fd2c5; background: #eef9f6; color: #126653; }
+.oauth-status.warn { border-color: #ead19b; background: #fff8e9; color: #8d6417; }
+.oauth-status.error { border-color: #e6b6ba; background: #fff2f3; color: #a03f48; }
+
+.oauth-status a {
+  color: #6558ad;
+  font-weight: 700;
+}
+
+.oauth-manual {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: end;
+}
+
+.oauth-import-card textarea {
+  font-family: Consolas, "SFMono-Regular", monospace;
+  font-size: 12px;
+}
+
+.oauth-import-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.oauth-credential-summary {
+  display: grid;
+  gap: 3px;
+  min-height: 40px;
+  padding: 7px 10px;
+  border: 1px solid #d8d2eb;
+  border-radius: 10px;
+  background: #f7f4ff;
+}
+
+.oauth-credential-summary strong {
+  color: #5c50a1;
+  font-size: 12px;
+}
+
+.oauth-credential-summary small {
+  overflow: hidden;
+  color: var(--muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .radio-label {
   align-self: center;
   display: flex;
@@ -1171,6 +1279,10 @@ dialog::backdrop {
   .credential-row .icon-btn,
   .target-row .icon-btn {
     justify-self: end;
+  }
+
+  .oauth-manual {
+    grid-template-columns: 1fr;
   }
 }
 
@@ -2667,6 +2779,43 @@ html:not([data-theme-mode="system"]) #themeToggleBtn::after {
   align-content: center;
 }
 
+.model-share-card {
+  display: flex;
+  min-height: 0;
+  flex-direction: column;
+}
+
+.model-share-card .share-chart-layout {
+  flex: 1;
+  grid-template-columns: minmax(300px, 0.95fr) minmax(0, 1.05fr);
+  min-height: 320px;
+  align-items: center;
+}
+
+.model-share-card .share-chart-plot {
+  max-width: 420px;
+}
+
+.model-share-card .share-chart-legend {
+  align-self: stretch;
+  align-content: space-evenly;
+}
+
+.model-share-card .share-legend-item {
+  padding: 6px 8px;
+}
+
+@media (min-width: 761px) and (max-width: 1200px) {
+  .model-share-card .share-chart-layout {
+    grid-template-columns: minmax(230px, 0.8fr) minmax(0, 1.2fr);
+    min-height: 300px;
+  }
+
+  .model-share-card .share-chart-plot {
+    max-width: 290px;
+  }
+}
+
 .share-legend-item {
   display: grid;
   grid-template-columns: 7px minmax(0, 1fr) auto;
@@ -2833,6 +2982,37 @@ html[data-theme="dark"] .outbound-card .inline-hint.warn {
   color: #efbd67;
 }
 
+html[data-theme="dark"] .oauth-entry-btn {
+  border-color: #514b76;
+  background: #29273a;
+  color: #d4ceff;
+}
+
+html[data-theme="dark"] .oauth-notice,
+html[data-theme="dark"] .oauth-login-card,
+html[data-theme="dark"] .oauth-import-card,
+html[data-theme="dark"] .oauth-credential-summary {
+  border-color: #46445f;
+  background: #20222d;
+}
+
+html[data-theme="dark"] .oauth-notice strong,
+html[data-theme="dark"] .oauth-login-card .section-head strong,
+html[data-theme="dark"] .oauth-import-card .section-head strong,
+html[data-theme="dark"] .oauth-credential-summary strong {
+  color: #cbc4ff;
+}
+
+html[data-theme="dark"] .oauth-status {
+  border-color: #465156;
+  background: #161e21;
+}
+
+html[data-theme="dark"] .oauth-status.working { border-color: #35695e; color: #8dd7c7; }
+html[data-theme="dark"] .oauth-status.success { border-color: #35695e; background: #172c28; color: #8dd7c7; }
+html[data-theme="dark"] .oauth-status.warn { border-color: #705c35; background: #2d281d; color: #e6c77f; }
+html[data-theme="dark"] .oauth-status.error { border-color: #70434a; background: #2d2023; color: #efa4ab; }
+
 html[data-theme="dark"] .proxy-options .radio-label {
   border-color: #405155;
   background: #151d20;
@@ -2904,6 +3084,19 @@ html[data-theme="dark"] .pill.info {
 
   .share-chart-legend {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .model-share-card .share-chart-layout {
+    grid-template-columns: 1fr;
+    min-height: 0;
+  }
+
+  .model-share-card .share-chart-plot {
+    max-width: 236px;
+  }
+
+  .model-share-card .share-chart-legend {
+    align-content: start;
   }
 }
 

@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Added Codex OAuth account providers with browser login/import, token refresh,
+  redacted public configuration, and account-level failover before switching to
+  the next provider.
+- Added session affinity for client session headers and `previous_response_id`,
+  with automatic bypass when the bound provider cannot serve the model.
+- Improved HTTPS-over-HTTP-proxy reliability by completing TLS through a
+  managed CONNECT agent instead of handing an unfinished socket to requests.
+- Expanded the Chinese project homepage with architecture, routing semantics,
+  installation guidance, privacy boundaries, and a current comparison with
+  CC Switch.
 - Added a lazy-loaded Radar tab embedding Codex Reset Radar, with clear source
   attribution, a non-commercial notice, removal contact, and a link promoting
   the site owner's Deng project.
